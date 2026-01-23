@@ -1,0 +1,111 @@
+* Tue Nov 18 2025 Sylvie Dyer syldyer (at) amazon.com - 2.0-37
+- Build with Python 3.13.9 for Windows
+
+* Tue Oct 07 2025 Aiden Yang yngfn (at) amazon.com - 2.0-37
+- Add S3 and SQS eusc-de-east-1 (THF) endpoints
+
+* Thu Aug 28 2025 Jie Luo jjieluo (at) amazon.com - 2.0-37
+- Update requests dependency to 2.32.4
+
+* Mon Aug 11 2025 Ishmael Doenmez idoenmez (at) amazon.com - 2.0-36
+- Add endpoint for us-isob-west-1
+- Bump version
+
+* Mon Jun 30 2025 Jie Luo jjieluo (at) amazon.com - 2.0-35
+- Bump version
+
+* Tue Jun 16 2025 Ishmael Doenmez idoenmez (at) amazon.com - 2.0-35
+- Add endpoint for eusc-de-east-1 
+
+* Tue Apr 8 2025 Don Buenaventura dobuenav (at) amazon.com - 2.0-34
+- Build with Python 3.11.12 for Windows
+
+* Fri Apr 4 2025 Jeremy Bost jerebost (at) amazon.com - 2.0-34
+- Address errors when MD5 checksum for S3 objects is unavailable for FIPS instances
+
+* Thu Feb 13 2025 Akshay Rane raneaks (at) amazon.com - 2.0-33
+- Remove occurrences of deprecated SafeConfigParser class
+- Qualified file path to resolve a SyntaxWarning
+
+* Tue Feb 4 2025 Don Buenaventura dobuenav (at) amazon.com - 2.0-33
+- When using config.packages.yum, clean the yum metadata before making the cache
+
+* Wed Nov 13 2024 Jason Zhu zjzhu@amazon.com (at) - 2.0-32
+- Updated Visual Studio C++ Redistributable to 14.40.33816.0
+
+* Tue Jul 9 2024 Kristian Darlington kddarli@amazon.com (at) - 2.0-31
+- Stop and restart cfn-hup around package updates
+
+* Thu Feb 29 2024 Kristian Darlington kddarli@amazon.com (at) - 2.0-30
+- Updated endpoints for ADC regions
+
+* Wed Jan 9 2024 Ale Salas salaleja@amazon.com (at) - 2.0-29
+- Using pip3 to install python packages
+- Removed deprecated flags for gem installs
+- Installing systemd service file
+- Made all bin/ scripts executables
+
+* Tue Oct 3 2023 Ryan Tong tongrya@amazon.com (at) - 2.0-28
+- Bump Python-Daemon to 2.2.4 and Build Windows executable using Python 3.11.6
+
+* Tue Sep 12 2023 Poorva Parande pparande@amazon.com (at) - 2.0-27
+- Build Windows executable using Python 3.11.5
+
+* Tue Jul 18 2023 Ryan Tong tongrya@amazon.com (at) - 2.0-26
+- Build Windows executable using Python 3.11.4
+
+* Mon Feb 20 2023 Garv Mathur mathurgv@amazon.com (at) - 2.0-24
+- Build Windows executable using Python 3.10.10
+
+* Mon Feb 6 2023 Poorva Parande pparande@amazon.com (at) - 2.0-22
+- Fix to parse URL with port number as string.
+
+* Mon Jan 9 2023 Garv Mathur mathurgv@amazon.com (at) - 2.0-21
+- Build Windows executable using Python 3.10.9
+- Fix string replacement issue while sending signal via cfn-signal
+- Create a symlink for all entrypoints in /usr/bin for AL2 and AL2022 rpms
+
+* Mon Nov 28 2022 Garv Mathur mathurgv@amazon.com (at) - 2.0-20
+- Fix koji build tags
+
+* Tue Nov 8 2022 Garv Mathur mathurgv@amazon.com (at) - 2.0-19
+- Use chevron in Windows,al2022 and source distribution having python >= 3.6 to parse mustache templates
+- Use pystache in AL2 and source distribution having python < 3.6
+- Bump chardet to 3.0.4 as requests package was throwing 1 exit code.
+
+* Mon Oct 31 2022 Garv Mathur mathurgv@amazon.com (at) - 2.0-18
+- Drop support for building a binary for x86 Windows.
+- Fix source distribution installation for Customers that already have setuptools>57.5.0
+- Build Windows executable using Python 3.10. Bump py2exe to 0.12.0.2. Use pywin32 compatible with python 3.10
+
+* Mon Oct 24 2022 - mathurgv (at) amazon.com (at) - 2.0-17
+- Bump requests so that it is Python 3.10 compatible
+- Addressing file leakage issue for Windows while capturing stdout and stderr
+- Added a strict mode to cfn-init to eagerly fail the bootstrapping process if rpm metadata cannot be found.
+- Fixed Windows installer failure when Visual Studio 2015-2022 is already installed.
+- Updated endpoints for ADC regions.
+
+* Fri Aug 19 2022 - dobuenav (at) amazon.com
+- Version bump to 2.0-16
+- Addressing issues with temp files being locked when logging commands for Windows
+- Also, ~7 years of changes :(
+
+* Fri Nov 20 2015 - xinningl (at) amazon.com
+- Validate SQS URLs against an explicit list of accepted patterns.
+
+* Fri May 01 2015 - mhhinkle (at) amazon.com
+- Validate S3 URLs against an explicit list of accepted patterns.
+
+* Wed Mar 25 2015 - adamthom (at) amazon.com
+- Update the bundled Requests to 2.6.0
+
+* Fri Jan 09 2015 - adamthom (at) amazon.com
+- Allow the certificate bundle to be overridden using CA_OVERRIDE env. variable or /etc/cfn/ca-override.pem.
+- Fix an issue where spaces in S3 keys were not being encoded properly for Signature V4 requests.
+
+* Fri Oct 17 2014 - adamthom (at) amazon.com
+- Use V4 signatures for SQS
+- Use V4 signatures for S3 when the region is specified
+
+* Fri Oct 10 2014 - mhhinkle (at) amazon.com
+- Updated cfn-signal to optionally use the CloudFormation SignalResource API

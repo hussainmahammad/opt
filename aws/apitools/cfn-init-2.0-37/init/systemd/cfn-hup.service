@@ -1,0 +1,9 @@
+[Unit]
+Description=cfn-hup daemon
+
+[Service]
+ExecStart=/usr/bin/cfn-hup -v
+PIDFile=/var/run/cfn-hup.pid
+
+[Install]
+WantedBy=multi-user.target
