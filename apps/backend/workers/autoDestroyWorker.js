@@ -8,48 +8,27 @@ const {
   AWS_REGION
 } = process.env;
 
-const auth = { username: JENKINS_USER, password: JENKINS_API_TOKEN };
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
 
 AWS.config.update({ region: AWS_REGION || "us-east-1" });
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-/* ===== CONFIG ===== */
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const AUTO_DESTROY_AFTER_MS = 30 * 60 * 1000; // 30 min
-const CHECK_INTERVAL_MS = 60 * 1000;          // every 1 min
+const CHECK_INTERVAL_MS = 60 * 1000;
+
+/* =========================================================
+   Helpers
+========================================================= */
 
 function wait(ms) {
   return new Promise(r => setTimeout(r, ms));
-}
-
-/* ===== HELPERS ===== */
-
-async function watchDestroy({ jobName, buildNumber, deploymentId }) {
-  while (true) {
-    const r = await axios.get(
-      `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
-      { auth }
-    );
-
-    if (!r.data.building) {
-      const success = r.data.result === "SUCCESS";
-      const finalStatus = success ? "DESTROYED" : "FAILED";
-
-      await dynamodb.update({
-        TableName: "Deployments",
-        Key: { deploymentId },
-        UpdateExpression: "SET #s = :s" + (success ? ", destroyedAt = :t" : ""),
-        ExpressionAttributeNames: { "#s": "status" },
-        ExpressionAttributeValues: success
-          ? { ":s": finalStatus, ":t": new Date().toISOString() }
-          : { ":s": finalStatus }
-      }).promise();
-
-      break;
-    }
-
-    await wait(5000);
-  }
 }
 
 async function getBuildNumberFromQueue(queueUrl) {
@@ -60,43 +39,107 @@ async function getBuildNumberFromQueue(queueUrl) {
   }
 }
 
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined || v === null) continue;
+    updates.push(`#${k} = :${k}`);
+    values[`:${k}`] = v;
+    names[`#${k}`] = k;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+async function watchDestroy({ jobName, buildNumber, deploymentId }) {
+  while (true) {
+    try {
+      const r = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+        { auth }
+      );
+
+      if (!r.data.building) {
+        const success = r.data.result === "SUCCESS";
+
+        await updateDeployment(deploymentId, {
+          status: success ? "DESTROYED" : "FAILED",
+          destroyedAt: success ? new Date().toISOString() : "NA"
+        });
+
+        break;
+      }
+    } catch (err) {
+      console.error("Destroy watcher error:", err.message);
+    }
+
+    await wait(5000);
+  }
+}
+
+/* =========================================================
+   Scan logic
+========================================================= */
+
 async function scanEligibleDeployments() {
   const now = Date.now();
 
   const res = await dynamodb.scan({
     TableName: "Deployments",
-    FilterExpression: "attribute_exists(completedAt) AND attribute_not_exists(destroyedAt)"
+    FilterExpression: "#s = :running",
+    ExpressionAttributeNames: {
+      "#s": "status"
+    },
+    ExpressionAttributeValues: {
+      ":running": "RUNNING"
+    }
   }).promise();
 
   for (const dep of res.Items || []) {
-    if (!dep.completedAt || !dep.destroyJob) continue;
+    if (!dep.completedAt || dep.completedAt === "NA") continue;
+    if (dep.destroyedAt && dep.destroyedAt !== "NA") continue;
 
     const completedTime = new Date(dep.completedAt).getTime();
     if (isNaN(completedTime)) continue;
 
     if (now - completedTime < AUTO_DESTROY_AFTER_MS) continue;
 
-    console.log("⏳ Auto-destroy triggered for", dep.deploymentId);
+    console.log("⏳ Auto-destroy:", dep.deploymentId);
 
     try {
       const trigger = await axios.post(
-        `${JENKINS_URL}/job/${dep.destroyJob}/build`,
-        {},
-        { auth }
+        `${JENKINS_URL}/job/${dep.destroyJobName}/buildWithParameters`,
+        null,
+        {
+          auth,
+          params: {
+            DESTROY_TARGET: dep.runtime
+          }
+        }
       );
 
-      const buildNumber = await getBuildNumberFromQueue(trigger.headers.location);
+      const buildNumber = await getBuildNumberFromQueue(
+        trigger.headers.location
+      );
 
-      await dynamodb.update({
-        TableName: "Deployments",
-        Key: { deploymentId: dep.deploymentId },
-        UpdateExpression: "SET #s = :s",
-        ExpressionAttributeNames: { "#s": "status" },
-        ExpressionAttributeValues: { ":s": "DESTROYING" }
-      }).promise();
+      await updateDeployment(dep.deploymentId, {
+        status: "DESTROYING",
+        destroyBuildNumber: buildNumber
+      });
 
       watchDestroy({
-        jobName: dep.destroyJob,
+        jobName: dep.destroyJobName,
         buildNumber,
         deploymentId: dep.deploymentId
       });
@@ -107,14 +150,16 @@ async function scanEligibleDeployments() {
   }
 }
 
-/* ===== STARTER ===== */
+/* =========================================================
+   Starter
+========================================================= */
 
 function startAutoDestroyWorker() {
   console.log("🚀 Auto-destroy worker started");
 
   setInterval(() => {
     scanEligibleDeployments().catch(err =>
-      console.error("❌ Auto-destroy scan error:", err.message)
+      console.error("Scan error:", err.message)
     );
   }, CHECK_INTERVAL_MS);
 }

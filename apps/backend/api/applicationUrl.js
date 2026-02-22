@@ -9,38 +9,91 @@ AWS.config.update({ region: AWS_REGION || "us-east-1" });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-// GET application URL from Deployments table
+/*
+GET /application-url/:deploymentId
+
+Returns application endpoint (ALB / Ingress)
+*/
+
 router.get("/application-url/:deploymentId", async (req, res) => {
   const { deploymentId } = req.params;
 
   try {
+    /* ===== 1. Fetch deployment ===== */
+
     const result = await dynamodb.get({
       TableName: "Deployments",
       Key: { deploymentId }
     }).promise();
 
-    if (!result.Item) {
-      return res.status(404).json({ error: "Deployment not found" });
-    }
+    const deployment = result.Item;
 
-    if (!result.Item.publicIp) {
-      return res.status(409).json({
-        error: "Instance not created yet",
-        status: result.Item.status,
-        completedAt: result.Item.completedAt || null
+    if (!deployment) {
+      return res.status(404).json({
+        error: "Deployment not found"
       });
     }
 
+    const {
+      status,
+      endpointUrl,
+      runtime,
+      appId,
+      appName,
+      completedAt
+    } = deployment;
+
+    /* ===== 2. Handle status cases ===== */
+
+    if (status === "FAILED") {
+      return res.status(400).json({
+        error: "Deployment failed",
+        status
+      });
+    }
+
+    if (status === "DESTROYED") {
+      return res.status(400).json({
+        error: "Application destroyed",
+        status
+      });
+    }
+
+    if (status === "QUEUED" || status === "DEPLOYING") {
+      return res.status(409).json({
+        error: "Application not ready yet",
+        status,
+        completedAt: completedAt || null
+      });
+    }
+
+    /* ===== 3. RUNNING but endpoint not yet recorded ===== */
+
+    if (!endpointUrl || endpointUrl === "NA") {
+      return res.status(409).json({
+        error: "Endpoint not available yet",
+        status,
+        completedAt: completedAt || null
+      });
+    }
+
+    /* ===== 4. Success ===== */
+
     res.json({
-      url: `http://${result.Item.publicIp}`,
-      status: result.Item.status,
-      appId: result.Item.appId,
-      completedAt: result.Item.completedAt || null
+      deploymentId,
+      appId,
+      appName,
+      runtime,
+      url: endpointUrl,
+      status,
+      completedAt: completedAt || null
     });
 
   } catch (err) {
-    console.error("application-url error:", err);
-    res.status(500).json({ error: "Failed to fetch application URL" });
+    console.error("application-url error:", err.message);
+    res.status(500).json({
+      error: "Failed to fetch application URL"
+    });
   }
 });
 

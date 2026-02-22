@@ -1,98 +1,159 @@
 const axios = require("axios");
-const AWS = require("aws-sdk");
 
 const {
   JENKINS_URL,
   JENKINS_USER,
-  JENKINS_API_TOKEN,
-  AWS_REGION,
-  ACCOUNT_C_ROLE_ARN
+  JENKINS_API_TOKEN
 } = process.env;
 
-const auth = { username: JENKINS_USER, password: JENKINS_API_TOKEN };
-const sts = new AWS.STS();
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
 
 function wait(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function assumeC() {
-  const r = await sts.assumeRole({
-    RoleArn: ACCOUNT_C_ROLE_ARN,
-    RoleSessionName: "deployment-watcher"
-  }).promise();
+/* =======================================================
+   Extract values from Jenkins console output
+   Now supports OBS_* format printed by pipeline
+======================================================= */
 
-  return new AWS.EC2({
-    region: AWS_REGION,
-    accessKeyId: r.Credentials.AccessKeyId,
-    secretAccessKey: r.Credentials.SecretAccessKey,
-    sessionToken: r.Credentials.SessionToken
-  });
+function extractValue(logs, key) {
+  const match = logs.match(new RegExp(`${key}=(.*)`));
+  return match ? match[1].trim() : "NA";
 }
 
-/* ---------- robust instance lookup ---------- */
+async function extractDeploymentInfo(jobName, buildNumber, runtime) {
+  try {
+    const logRes = await axios.get(
+      `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
+      { auth }
+    );
 
-async function findInstance(ec2, retries = 36) { // 36 × 10s = 6 minutes
-  for (let i = 0; i < retries; i++) {
-    const r = await ec2.describeInstances({
-      Filters: [
-        { Name: "tag:Name", Values: ["petcart-shop"] },
-        { Name: "instance-state-name", Values: ["pending", "running"] }
-      ]
-    }).promise();
+    const logs = logRes.data;
 
-    const inst = r.Reservations?.[0]?.Instances?.[0];
-    if (inst && inst.InstanceId && inst.PrivateDnsName) return inst;
+    /* ===================================================
+       Read OBS values (printed by Jenkins)
+    =================================================== */
 
-    console.log("Instance not ready yet, retrying...");
-    await wait(10000);
+    const info = {
+      endpointUrl: extractValue(logs, "OBS_ENDPOINT"),
+
+      logGroupAccess: extractValue(logs, "OBS_LOG_GROUP_ACCESS"),
+      logGroupError: extractValue(logs, "OBS_LOG_GROUP_ERROR"),
+      logGroup: extractValue(logs, "OBS_LOG_GROUP"),
+
+      asgName: extractValue(logs, "OBS_ASG"),
+
+      clusterName: extractValue(logs, "OBS_CLUSTER"),
+      namespace: extractValue(logs, "OBS_NAMESPACE"),
+      deploymentName: extractValue(logs, "OBS_DEPLOYMENT"),
+
+      metricsEnabled:
+        extractValue(logs, "OBS_METRICS_ENABLED") === "true",
+
+      metricsType: extractValue(logs, "OBS_METRICS_TYPE")
+    };
+
+    /* ===================================================
+       Runtime safety defaults
+    =================================================== */
+
+    if (runtime === "ec2") {
+      info.metricsEnabled = true;
+      info.metricsType = "ec2";
+    }
+
+    if (runtime === "eks-fargate") {
+      info.metricsEnabled = false;
+      info.metricsType = "NA";
+    }
+
+    if (runtime === "eks-ec2") {
+      info.metricsEnabled = true;
+      info.metricsType = "eks";
+    }
+
+    return info;
+
+  } catch (err) {
+    console.error("Console parsing failed:", err.message);
+    return {};
   }
-  return null;
 }
 
-/* ---------- WATCHER ---------- */
+/* =======================================================
+   Deployment Watcher
+======================================================= */
 
-async function watchDeployment({ deploymentId, jobName, buildNumber, updateDeployment }) {
-  console.log("Watcher started for", deploymentId);
+async function watchDeployment({
+  deploymentId,
+  jobName,
+  buildNumber,
+  runtime,
+  updateDeployment
+}) {
+  console.log("Deploy watcher started:", deploymentId);
 
   while (true) {
     try {
-      const b = await axios.get(
+      const buildRes = await axios.get(
         `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
         { auth }
       );
 
-      if (!b.data.building) {
-        const status = b.data.result || "FAILED";
+      /* ---------- Wait until build finishes ---------- */
+      if (!buildRes.data.building) {
+        const result = buildRes.data.result || "FAILED";
 
-        let instanceData = {};
+        /* ---------- FAILED ---------- */
+        if (result !== "SUCCESS") {
+          await updateDeployment(deploymentId, {
+            status: "FAILED",
+            completedAt: new Date().toISOString(),
+            deployBuildNumber: buildNumber
+          });
 
-        try {
-          const ec2 = await assumeC();
-          const inst = await findInstance(ec2);
-
-          if (inst) {
-            if (inst.PublicIpAddress) instanceData.publicIp = inst.PublicIpAddress;
-            if (inst.InstanceId) instanceData.instanceId = inst.InstanceId;
-            if (inst.PrivateDnsName) instanceData.host = inst.PrivateDnsName;
-
-            instanceData.accessLogGroup = "/petcart/nginx/access";
-            instanceData.errorLogGroup = "/petcart/nginx/error";
-          } else {
-            console.error("Instance not found after waiting 6 minutes");
-          }
-
-        } catch (e) {
-          console.error("EC2 lookup failed:", e.message);
+          console.log("Deployment FAILED:", deploymentId);
+          break;
         }
 
+        /* ---------- SUCCESS ---------- */
+
+        const info = await extractDeploymentInfo(
+          jobName,
+          buildNumber,
+          runtime
+        );
+
         const payload = {
-          status,
+          status: "RUNNING",
           completedAt: new Date().toISOString(),
-          ...instanceData
+          deployBuildNumber: buildNumber,
+
+          endpointUrl: info.endpointUrl || "NA",
+
+          logGroupAccess: info.logGroupAccess || "NA",
+          logGroupError: info.logGroupError || "NA",
+          logGroup: info.logGroup || "NA",
+
+          metricsEnabled:
+            typeof info.metricsEnabled === "boolean"
+              ? info.metricsEnabled
+              : false,
+
+          metricsType: info.metricsType || "NA",
+
+          asgName: info.asgName || "NA",
+
+          clusterName: info.clusterName || "NA",
+          namespace: info.namespace || "NA",
+          deploymentName: info.deploymentName || "NA"
         };
 
-        console.log("Watcher updating:", payload);
+        console.log("Deployment SUCCESS update:", payload);
 
         await updateDeployment(deploymentId, payload);
         break;

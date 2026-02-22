@@ -11,7 +11,7 @@ AWS.config.update({ region: AWS_REGION || "us-east-1" });
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const sts = new AWS.STS();
 
-/* ================= HELPERS ================= */
+/* ================= ASSUME ROLE ================= */
 
 async function assumeAccountCLogs() {
   const r = await sts.assumeRole({
@@ -27,61 +27,181 @@ async function assumeAccountCLogs() {
   });
 }
 
-async function getLatestDeployment(appId) {
-  const res = await dynamodb.scan({
+/* ================= HELPERS ================= */
+
+async function getDeployment(deploymentId) {
+  const res = await dynamodb.get({
     TableName: "Deployments",
-    FilterExpression: "appId = :a",
-    ExpressionAttributeValues: { ":a": appId }
+    Key: { deploymentId }
   }).promise();
 
-  if (!res.Items || res.Items.length === 0) return null;
+  return res.Item;
+}
 
-  return res.Items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+/* Get latest active stream (for EKS) */
+async function getLatestStream(logs, logGroupName) {
+  const data = await logs.describeLogStreams({
+    logGroupName,
+    orderBy: "LastEventTime",
+    descending: true,
+    limit: 1
+  }).promise();
+
+  if (!data.logStreams.length) return null;
+
+  return data.logStreams[0].logStreamName;
+}
+
+/* Stream logs continuously (SSE) */
+async function streamLogEvents(res, logs, logGroupName, logStreamName) {
+  let nextToken = null;
+
+  const interval = setInterval(async () => {
+    try {
+      const params = {
+        logGroupName,
+        logStreamName,
+        startFromHead: false
+      };
+
+      if (nextToken) params.nextToken = nextToken;
+
+      const data = await logs.getLogEvents(params).promise();
+
+      nextToken = data.nextForwardToken;
+
+      for (const event of data.events) {
+        res.write(`data: ${JSON.stringify({
+          timestamp: event.timestamp,
+          message: event.message
+        })}\n\n`);
+      }
+
+    } catch (err) {
+      console.error("Log streaming error:", err.message);
+    }
+  }, 3000);
+
+  res.on("close", () => {
+    clearInterval(interval);
+  });
 }
 
 /* ================= ROUTE ================= */
+/*
+EC2:
+GET /app-logs/:deploymentId?type=access|error
 
-router.get("/app-logs/:appId", async (req, res) => {
-  const { appId } = req.params;
+EKS:
+GET /app-logs/:deploymentId
+*/
+
+router.get("/app-logs/:deploymentId", async (req, res) => {
+  const { deploymentId } = req.params;
   const { type } = req.query;
 
-  if (!type || !["access", "error"].includes(type)) {
-    return res.status(400).json({ error: "type must be 'access' or 'error'" });
-  }
-
   try {
-    const deployment = await getLatestDeployment(appId);
+    /* ===== 1. Fetch deployment ===== */
+
+    const deployment = await getDeployment(deploymentId);
 
     if (!deployment) {
-      return res.status(404).json({ error: "No deployment found for this app" });
+      return res.status(404).json({ error: "Deployment not found" });
     }
 
-    const logGroupName =
-      type === "access" ? deployment.accessLogGroup : deployment.errorLogGroup;
-
-    if (!logGroupName) {
-      return res.status(404).json({ error: "No log group recorded for this deployment" });
+    if (deployment.status !== "RUNNING") {
+      return res.status(400).json({ error: "Deployment not running" });
     }
+
+    const runtime = deployment.runtime;
+    let logGroupName;
+
+    /* ================= EC2 ================= */
+
+    if (runtime === "ec2") {
+      if (!type || !["access", "error"].includes(type)) {
+        return res.status(400).json({
+          error: "For EC2, type=access or error is required"
+        });
+      }
+
+      logGroupName =
+        type === "access"
+          ? deployment.logGroupAccess
+          : deployment.logGroupError;
+
+      if (!logGroupName || logGroupName === "NA") {
+        return res.status(400).json({
+          error: "Log group not available for this deployment"
+        });
+      }
+    }
+
+    /* ================= EKS (Fargate / EC2) ================= */
+
+    else if (runtime === "eks-fargate" || runtime === "eks-ec2") {
+      logGroupName = deployment.logGroup;
+
+      if (!logGroupName || logGroupName === "NA") {
+        return res.status(400).json({
+          error: "Log group not available for this deployment"
+        });
+      }
+    }
+
+    else {
+      return res.status(400).json({
+        error: "Unsupported runtime"
+      });
+    }
+
+    /* ===== 2. CloudWatch Client ===== */
 
     const logs = await assumeAccountCLogs();
 
-    const result = await logs.filterLogEvents({
-      logGroupName,
-      limit: 100,
-      startTime: Date.now() - 1000 * 60 * 60 // last 1 hour
-    }).promise();
+    /* ===== 3. Determine stream ===== */
 
-    res.json({
-      appId,
-      type,
-      logGroup: logGroupName,
-      count: result.events.length,
-      events: result.events
+    let logStreamName;
+
+    if (runtime === "ec2") {
+      // EC2 nginx logs → usually single stream
+      const stream = await getLatestStream(logs, logGroupName);
+      if (!stream) {
+        return res.status(404).json({ error: "No log streams found" });
+      }
+      logStreamName = stream;
+    } else {
+      // EKS / Fargate → many pod streams → pick latest
+      const stream = await getLatestStream(logs, logGroupName);
+      if (!stream) {
+        return res.status(404).json({ error: "No active pod streams found" });
+      }
+      logStreamName = stream;
+    }
+
+    /* ===== 4. SSE Headers ===== */
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
     });
+
+    res.write(`data: ${JSON.stringify({
+      message: "Streaming logs",
+      deploymentId,
+      runtime,
+      logGroupName,
+      logStreamName
+    })}\n\n`);
+
+    /* ===== 5. Start streaming ===== */
+
+    streamLogEvents(res, logs, logGroupName, logStreamName);
 
   } catch (err) {
     console.error("App logs error:", err.message);
-    res.status(500).json({ error: "Failed to fetch app logs" });
+    res.status(500).json({ error: "Failed to fetch logs" });
   }
 });
 

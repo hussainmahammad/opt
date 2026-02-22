@@ -2,108 +2,206 @@ const router = require("express").Router();
 const axios = require("axios");
 const AWS = require("aws-sdk");
 
-const { JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN, AWS_REGION } = process.env;
-const auth = { username: JENKINS_USER, password: JENKINS_API_TOKEN };
+/* ================= ENV ================= */
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
 
 AWS.config.update({ region: AWS_REGION || "us-east-1" });
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-/* ---------- helpers ---------- */
-
-async function getLatestDeployment(appId) {
-  const r = await dynamodb.scan({
-    TableName: "Deployments",
-    FilterExpression: "appId = :a",
-    ExpressionAttributeValues: { ":a": appId }
-  }).promise();
-
-  if (!r.Items || r.Items.length === 0) return null;
-
-  return r.Items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-}
-
-async function updateStatus(deploymentId, status, destroyed = false) {
-  const update = ["#s = :s"];
-  const values = { ":s": status };
-  const names = { "#s": "status" };
-
-  if (destroyed) {
-    update.push("destroyedAt = :t");
-    values[":t"] = new Date().toISOString();
-  }
-
-  await dynamodb.update({
-    TableName: "Deployments",
-    Key: { deploymentId },
-    UpdateExpression: "SET " + update.join(", "),
-    ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values
-  }).promise();
-}
+/* ================= HELPERS ================= */
 
 function wait(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function watchDestroy({ jobName, buildNumber, deploymentId }) {
+async function getDeployment(deploymentId) {
+  const res = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+
+  return res.Item;
+}
+
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null) continue;
+
+    updates.push(`#${key} = :${key}`);
+    values[`:${key}`] = value;
+    names[`#${key}`] = key;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+async function getBuildNumberFromQueue(queueUrl) {
   while (true) {
-    const r = await axios.get(
-      `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
-      { auth }
-    );
+    const res = await axios.get(`${queueUrl}api/json`, { auth });
+    const buildNumber = res.data.executable?.number;
 
-    if (!r.data.building) {
-      const finalStatus = r.data.result === "SUCCESS" ? "DESTROYED" : "FAILED";
-      await updateStatus(deploymentId, finalStatus, true);
-      break;
-    }
+    if (buildNumber) return buildNumber;
 
-    await wait(5000);
+    await wait(1000);
   }
 }
 
-/* ---------- route ---------- */
+/* ================= DESTROY WATCHER ================= */
+
+async function watchDestroy({ jobName, buildNumber, deploymentId }) {
+  console.log("Destroy watcher started:", deploymentId);
+
+  while (true) {
+    try {
+      const res = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+        { auth }
+      );
+
+      if (!res.data.building) {
+        const success = res.data.result === "SUCCESS";
+
+        await updateDeployment(deploymentId, {
+          status: success ? "DESTROYED" : "FAILED",
+          destroyedAt: new Date().toISOString(),
+          destroyBuildNumber: buildNumber
+        });
+
+        console.log(
+          success
+            ? `Deployment destroyed: ${deploymentId}`
+            : `Destroy failed: ${deploymentId}`
+        );
+
+        break;
+      }
+
+    } catch (err) {
+      console.error("Destroy watcher error:", err.message);
+    }
+
+    await wait(10000); // poll every 10s
+  }
+}
+
+/* ================= DESTROY API ================= */
 
 router.post("/destroy", async (req, res) => {
   try {
-    const { appId } = req.body;
-    if (!appId) return res.status(400).json({ error: "appId required" });
+    const { deploymentId } = req.body;
 
-    const dep = await getLatestDeployment(appId);
-    if (!dep) return res.status(404).json({ error: "No deployment found" });
-
-    if (dep.status === "DESTROYED" || dep.destroyedAt) {
-      return res.json({ status: "ALREADY_DESTROYED" });
+    if (!deploymentId) {
+      return res.status(400).json({
+        error: "deploymentId required"
+      });
     }
 
-    const trigger = await axios.post(
-      `${JENKINS_URL}/job/${dep.destroyJob}/build`,
-      {},
-      { auth }
+    /* ===== 1. Fetch Deployment ===== */
+
+    const dep = await getDeployment(deploymentId);
+
+    if (!dep) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    if (dep.status === "DESTROYED") {
+      return res.json({
+        deploymentId,
+        status: "ALREADY_DESTROYED"
+      });
+    }
+
+    const {
+      destroyJobName,
+      runtime,
+      appId,
+      appName
+    } = dep;
+
+    if (!destroyJobName || destroyJobName === "NA") {
+      return res.status(400).json({
+        error: "Destroy job not configured"
+      });
+    }
+
+    /* ===== 2. Trigger Jenkins Destroy ===== */
+
+    const triggerRes = await axios.post(
+      `${JENKINS_URL}/job/${destroyJobName}/buildWithParameters`,
+      null,
+      {
+        auth,
+        params: {
+          APP_ID: appId,
+          APP_NAME: appName,
+          DESTROY_TARGET: runtime
+        }
+      }
     );
 
-    const queueUrl = trigger.headers.location;
+    /* ===== 3. Get Build Number ===== */
 
-    let buildNumber;
-    while (!buildNumber) {
-      const q = await axios.get(`${queueUrl}api/json`, { auth });
-      buildNumber = q.data.executable?.number;
-      if (!buildNumber) await wait(1000);
-    }
+    const destroyBuildNumber = await getBuildNumberFromQueue(
+      triggerRes.headers.location
+    );
 
-    await updateStatus(dep.deploymentId, "DESTROYING");
+    /* ===== 4. Update status → DESTROYING ===== */
 
-    watchDestroy({
-      jobName: dep.destroyJob,
-      buildNumber,
-      deploymentId: dep.deploymentId
+    await updateDeployment(deploymentId, {
+      status: "DESTROYING",
+      destroyBuildNumber
     });
 
-    res.json({ status: "DESTROYING" });
+    /* ===== 5. Start Destroy Watcher ===== */
+
+    watchDestroy({
+      jobName: destroyJobName,
+      buildNumber: destroyBuildNumber,
+      deploymentId
+    });
+
+    /* ===== 6. Response ===== */
+
+    res.json({
+      message: "Destroy started",
+      deploymentId,
+      runtime,
+      destroyJobName,
+      destroyBuildNumber,
+      status: "DESTROYING"
+    });
 
   } catch (err) {
-    console.error("Destroy error:", err.message);
-    res.status(500).json({ error: "Failed to destroy" });
+    console.error("Destroy API error:", err.message);
+
+    res.status(500).json({
+      error: "Failed to destroy deployment"
+    });
   }
 });
 

@@ -1,0 +1,2185 @@
+PORT=3000 
+
+JENKINS_URL=http://localhost:8080
+JENKINS_USER=admin
+JENKINS_API_TOKEN=119478d638f8b1dd14c7606c04cad4cf37
+
+DEPLOY_JOB=petcart-deploy
+DESTROY_JOB=petcart-destroy
+ACCOUNT_C_ROLE_ARN=arn:aws:iam::867809929056:role/account-c-admin-for-account-a
+AWS_REGION=us-east-1
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+
+const autoDestroyModule = require("./workers/autoDestroyWorker");
+const startAutoDestroyWorker =
+  typeof autoDestroyModule === "function"
+    ? autoDestroyModule
+    : autoDestroyModule.startAutoDestroyWorker;
+
+const app = express();
+
+app.use(cors());            // Allow all origins
+app.use(express.json());
+
+app.use("/", require("./api/health.api"));
+app.use("/api", require("./api/deploy.api"));
+app.use("/api", require("./api/destroy.api"));
+app.use("/api", require("./api/stop.api"));
+app.use("/api", require("./api/phases.api"));
+app.use("/api", require("./api/jenkinsLogs.api"));
+app.use("/api", require("./api/appLogs.api"));
+app.use("/api", require("./api/metrics.api"));
+app.use("/api", require("./api/logsSse")); 
+app.use("/api", require("./api/applicationUrl")); 
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+
+  if (typeof startAutoDestroyWorker === "function") {
+    startAutoDestroyWorker();
+  } else {
+    console.error(
+      "❌ Auto-destroy worker not started. Export is:",
+      autoDestroyModule
+    );
+  }
+});
+const router = require("express").Router();
+router.get("/health", (_, res) => res.json({ status: "OK" }));
+module.exports = router;const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+const { watchDeployment } = require("../workers/deploymentWatcher");
+
+/* ================= ENV ================= */
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* ================= SAFE UPDATE ================= */
+
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null) continue;
+
+    updates.push(`#${key} = :${key}`);
+    values[`:${key}`] = value;
+    names[`#${key}`] = key;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+/* ================= HELPERS ================= */
+
+async function getApplication(appId) {
+  const result = await dynamodb.get({
+    TableName: "Applications",
+    Key: { appId }
+  }).promise();
+
+  return result.Item;
+}
+
+async function getBuildNumberFromQueue(queueUrl) {
+  while (true) {
+    const res = await axios.get(`${queueUrl}api/json`, { auth });
+
+    if (res.data.executable?.number) {
+      return res.data.executable.number;
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+/* ================= DEPLOY API ================= */
+
+router.post("/deploy", async (req, res) => {
+  try {
+    const { appId, runtime } = req.body;
+
+    /* ===== 1. Basic Validation ===== */
+
+    if (!appId || !runtime) {
+      return res.status(400).json({
+        error: "appId and runtime required"
+      });
+    }
+
+    const allowedRuntimes = ["ec2", "eks-fargate", "eks-ec2"];
+
+    if (!allowedRuntimes.includes(runtime)) {
+      return res.status(400).json({
+        error: "Invalid runtime"
+      });
+    }
+
+    /* ===== 2. Fetch Application ===== */
+
+    const app = await getApplication(appId);
+
+    if (!app) {
+      return res.status(404).json({
+        error: "Application not found"
+      });
+    }
+
+    const {
+      appName,
+      deployJobName,
+      destroyJobName,
+      ec2Support,
+      eksFargateSupport,
+      eksEc2Support
+    } = app;
+
+    /* ===== 3. Validate Runtime Support ===== */
+
+    if (runtime === "ec2" && !ec2Support) {
+      return res.status(400).json({
+        error: "EC2 not supported for this application"
+      });
+    }
+
+    if (runtime === "eks-fargate" && !eksFargateSupport) {
+      return res.status(400).json({
+        error: "EKS Fargate not supported for this application"
+      });
+    }
+
+    if (runtime === "eks-ec2" && !eksEc2Support) {
+      return res.status(400).json({
+        error: "EKS EC2 not supported for this application"
+      });
+    }
+
+    /* ===== 4. Create Deployment ID ===== */
+
+    const deploymentId = `dep-${Date.now()}`;
+    const createdAt = new Date().toISOString();
+
+    /* ===== 5. Insert Initial Deployment Record ===== */
+
+    await dynamodb.put({
+      TableName: "Deployments",
+      Item: {
+        deploymentId,
+        appId,
+        appName,
+        runtime,
+
+        /* Pipeline */
+        deployJobName,
+        destroyJobName,
+        deployBuildNumber: "NA",
+        destroyBuildNumber: "NA",
+
+        /* Status */
+        status: "QUEUED",
+        createdAt,
+        completedAt: "NA",
+        destroyedAt: "NA",
+
+        /* Endpoint */
+        endpointUrl: "NA",
+
+        /* Logs */
+        logGroupAccess: "NA",
+        logGroupError: "NA",
+        logGroup: "NA",
+
+        /* Metrics */
+        metricsEnabled: false,
+        metricsType: "NA",
+
+        /* EC2 */
+        asgName: "NA",
+
+        /* EKS */
+        clusterName: "NA",
+        namespace: "NA",
+        deploymentName: "NA"
+      }
+    }).promise();
+
+    /* ===== 6. Trigger Jenkins ===== */
+
+    const triggerResponse = await axios.post(
+      `${JENKINS_URL}/job/${deployJobName}/buildWithParameters`,
+      null,
+      {
+        auth,
+        params: {
+          APP_ID: appId,
+          APP_NAME: appName,
+          DEPLOY_TARGET: runtime
+        }
+      }
+    );
+
+    /* ===== 7. Get Build Number ===== */
+
+    const deployBuildNumber = await getBuildNumberFromQueue(
+      triggerResponse.headers.location
+    );
+
+    /* ===== 8. Update Status → DEPLOYING ===== */
+
+    await updateDeployment(deploymentId, {
+      deployBuildNumber,
+      status: "DEPLOYING"
+    });
+
+    /* ===== 9. Start Watcher ===== */
+
+    watchDeployment({
+      deploymentId,
+      jobName: deployJobName,
+      buildNumber: deployBuildNumber,
+      runtime,
+      appId,
+      appName,
+      updateDeployment
+    });
+
+    /* ===== 10. Response ===== */
+
+    res.json({
+      message: "Deployment started",
+      deploymentId,
+      appId,
+      appName,
+      runtime,
+      deployJobName,
+      destroyJobName,
+      deployBuildNumber
+    });
+
+  } catch (error) {
+    console.error("Deploy API Error:", error.message);
+
+    res.status(500).json({
+      error: "Deployment failed"
+    });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+
+/* ================= ENV ================= */
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* ================= HELPERS ================= */
+
+function wait(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function getDeployment(deploymentId) {
+  const res = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+
+  return res.Item;
+}
+
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null) continue;
+
+    updates.push(`#${key} = :${key}`);
+    values[`:${key}`] = value;
+    names[`#${key}`] = key;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+async function getBuildNumberFromQueue(queueUrl) {
+  while (true) {
+    const res = await axios.get(`${queueUrl}api/json`, { auth });
+    const buildNumber = res.data.executable?.number;
+
+    if (buildNumber) return buildNumber;
+
+    await wait(1000);
+  }
+}
+
+/* ================= DESTROY WATCHER ================= */
+
+async function watchDestroy({ jobName, buildNumber, deploymentId }) {
+  console.log("Destroy watcher started:", deploymentId);
+
+  while (true) {
+    try {
+      const res = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+        { auth }
+      );
+
+      if (!res.data.building) {
+        const success = res.data.result === "SUCCESS";
+
+        await updateDeployment(deploymentId, {
+          status: success ? "DESTROYED" : "FAILED",
+          destroyedAt: new Date().toISOString(),
+          destroyBuildNumber: buildNumber
+        });
+
+        console.log(
+          success
+            ? `Deployment destroyed: ${deploymentId}`
+            : `Destroy failed: ${deploymentId}`
+        );
+
+        break;
+      }
+
+    } catch (err) {
+      console.error("Destroy watcher error:", err.message);
+    }
+
+    await wait(10000); // poll every 10s
+  }
+}
+
+/* ================= DESTROY API ================= */
+
+router.post("/destroy", async (req, res) => {
+  try {
+    const { deploymentId } = req.body;
+
+    if (!deploymentId) {
+      return res.status(400).json({
+        error: "deploymentId required"
+      });
+    }
+
+    /* ===== 1. Fetch Deployment ===== */
+
+    const dep = await getDeployment(deploymentId);
+
+    if (!dep) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    if (dep.status === "DESTROYED") {
+      return res.json({
+        deploymentId,
+        status: "ALREADY_DESTROYED"
+      });
+    }
+
+    const {
+      destroyJobName,
+      runtime,
+      appId,
+      appName
+    } = dep;
+
+    if (!destroyJobName || destroyJobName === "NA") {
+      return res.status(400).json({
+        error: "Destroy job not configured"
+      });
+    }
+
+    /* ===== 2. Trigger Jenkins Destroy ===== */
+
+    const triggerRes = await axios.post(
+      `${JENKINS_URL}/job/${destroyJobName}/buildWithParameters`,
+      null,
+      {
+        auth,
+        params: {
+          APP_ID: appId,
+          APP_NAME: appName,
+          DESTROY_TARGET: runtime
+        }
+      }
+    );
+
+    /* ===== 3. Get Build Number ===== */
+
+    const destroyBuildNumber = await getBuildNumberFromQueue(
+      triggerRes.headers.location
+    );
+
+    /* ===== 4. Update status → DESTROYING ===== */
+
+    await updateDeployment(deploymentId, {
+      status: "DESTROYING",
+      destroyBuildNumber
+    });
+
+    /* ===== 5. Start Destroy Watcher ===== */
+
+    watchDestroy({
+      jobName: destroyJobName,
+      buildNumber: destroyBuildNumber,
+      deploymentId
+    });
+
+    /* ===== 6. Response ===== */
+
+    res.json({
+      message: "Destroy started",
+      deploymentId,
+      runtime,
+      destroyJobName,
+      destroyBuildNumber,
+      status: "DESTROYING"
+    });
+
+  } catch (err) {
+    console.error("Destroy API error:", err.message);
+
+    res.status(500).json({
+      error: "Failed to destroy deployment"
+    });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+async function getDeployment(deploymentId) {
+  const r = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+
+  return r.Item;
+}
+
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined || v === null) continue;
+    updates.push(`#${k} = :${k}`);
+    values[`:${k}`] = v;
+    names[`#${k}`] = k;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+async function getCrumb() {
+  const r = await axios.get(
+    `${JENKINS_URL}/crumbIssuer/api/json`,
+    { auth }
+  );
+
+  return {
+    [r.data.crumbRequestField]: r.data.crumb
+  };
+}
+
+/* =========================================================
+   Route
+   POST /stop
+========================================================= */
+
+router.post("/stop", async (req, res) => {
+  const { deploymentId } = req.body;
+
+  if (!deploymentId) {
+    return res.status(400).json({
+      error: "deploymentId required"
+    });
+  }
+
+  try {
+    /* ===== 1. Get deployment ===== */
+
+    const dep = await getDeployment(deploymentId);
+
+    if (!dep) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    /* ===== 2. Validate state ===== */
+
+    if (dep.status !== "DEPLOYING") {
+      return res.json({
+        status: "NOT_RUNNING",
+        message: "Deployment is not in progress"
+      });
+    }
+
+    const jobName = dep.deployJobName;
+    const buildNumber = dep.deployBuildNumber;
+
+    if (!buildNumber || buildNumber === "NA") {
+      return res.json({
+        status: "NOT_STARTED"
+      });
+    }
+
+    /* ===== 3. Stop Jenkins build ===== */
+
+    const crumbHeader = await getCrumb();
+
+    try {
+      await axios.post(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/stop`,
+        {},
+        { auth, headers: crumbHeader }
+      );
+    } catch (e) {
+      console.warn("Stop request returned error, ignoring:", e.response?.status);
+    }
+
+    /* ===== 4. Update deployment ===== */
+
+    await updateDeployment(deploymentId, {
+      status: "FAILED",
+      completedAt: new Date().toISOString()
+    });
+
+    /* ===== 5. Response ===== */
+
+    res.json({
+      deploymentId,
+      jobName,
+      buildNumber,
+      status: "STOPPED"
+    });
+
+  } catch (err) {
+    console.error("Stop error:", err.message);
+
+    res.status(500).json({
+      error: "Failed to stop deployment"
+    });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+function normalize(status) {
+  if (status === "IN_PROGRESS") return "RUNNING";
+  if (status === "SUCCESS") return "COMPLETED";
+  if (status === "FAILED") return "FAILED";
+  if (status === "ABORTED") return "FAILED";
+  return "PENDING";
+}
+
+const UI_PHASES = [
+  "Prepare",
+  "Build",
+  "Setup",
+  "Deploy",
+  "Validate",
+  "Complete"
+];
+
+/*
+GET /phases/:deploymentId?type=deploy|destroy
+*/
+
+router.get("/phases/:deploymentId", async (req, res) => {
+  try {
+    const { deploymentId } = req.params;
+    const type = req.query.type || "deploy";
+
+    /* ===== 1. Validate type ===== */
+
+    if (!["deploy", "destroy"].includes(type)) {
+      return res.status(400).json({
+        error: "type must be deploy or destroy"
+      });
+    }
+
+    /* ===== 2. Fetch deployment ===== */
+
+    const depRes = await dynamodb.get({
+      TableName: "Deployments",
+      Key: { deploymentId }
+    }).promise();
+
+    if (!depRes.Item) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    const deployment = depRes.Item;
+
+    /* ===== 3. Select job & build ===== */
+
+    const jobName =
+      type === "destroy"
+        ? deployment.destroyJobName
+        : deployment.deployJobName;
+
+    const buildNumber =
+      type === "destroy"
+        ? deployment.destroyBuildNumber
+        : deployment.deployBuildNumber;
+
+    /* ===== 4. Build not started ===== */
+
+    if (!buildNumber || buildNumber === "NA") {
+      return res.json({
+        deploymentId,
+        type,
+        job: jobName,
+        buildNumber: null,
+        phases: UI_PHASES.map(p => ({
+          name: p,
+          status: "PENDING"
+        })),
+        message: "Build not started yet"
+      });
+    }
+
+    /* ===== 5. Fetch Jenkins stages ===== */
+
+    let stages = [];
+
+    try {
+      const wf = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/wfapi/describe`,
+        { auth }
+      );
+
+      stages = wf.data.stages || [];
+    } catch (e) {
+      // wfapi may not be ready yet
+      return res.json({
+        deploymentId,
+        type,
+        job: jobName,
+        buildNumber,
+        phases: UI_PHASES.map(p => ({
+          name: p,
+          status: "PENDING"
+        })),
+        message: "Stages not available yet"
+      });
+    }
+
+    /* ===== 6. Map to UI phases ===== */
+
+    const phases = UI_PHASES.map(p => ({
+      name: p,
+      status: "PENDING"
+    }));
+
+    stages.forEach(stage => {
+      const idx = UI_PHASES.indexOf(stage.name);
+      if (idx !== -1) {
+        phases[idx].status = normalize(stage.status);
+      }
+    });
+
+    /* ===== 7. Response ===== */
+
+    res.json({
+      deploymentId,
+      type,
+      job: jobName,
+      buildNumber,
+      phases
+    });
+
+  } catch (err) {
+    console.error("Phases error:", err.message);
+
+    res.status(500).json({
+      error: "Failed to fetch phases"
+    });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/*
+GET /jenkins-logs/:deploymentId?type=deploy|destroy&from=0
+*/
+
+router.get("/jenkins-logs/:deploymentId", async (req, res) => {
+  try {
+    const { deploymentId } = req.params;
+    const type = req.query.type || "deploy";
+    const offset = Number(req.query.from || 0);
+
+    /* ===== 1. Validate type ===== */
+
+    if (!["deploy", "destroy"].includes(type)) {
+      return res.status(400).json({
+        error: "type must be deploy or destroy"
+      });
+    }
+
+    /* ===== 2. Get deployment ===== */
+
+    const depRes = await dynamodb.get({
+      TableName: "Deployments",
+      Key: { deploymentId }
+    }).promise();
+
+    if (!depRes.Item) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    const deployment = depRes.Item;
+
+    /* ===== 3. Select job & build ===== */
+
+    const jobName =
+      type === "destroy"
+        ? deployment.destroyJobName
+        : deployment.deployJobName;
+
+    const buildNumber =
+      type === "destroy"
+        ? deployment.destroyBuildNumber
+        : deployment.deployBuildNumber;
+
+    /* ===== 4. Build not started ===== */
+
+    if (!buildNumber || buildNumber === "NA") {
+      return res.json({
+        deploymentId,
+        type,
+        job: jobName,
+        logs: "",
+        nextOffset: offset,
+        complete: false,
+        message: "Build not started yet"
+      });
+    }
+
+    /* ===== 5. Fetch progressive logs ===== */
+
+    const response = await axios.get(
+      `${JENKINS_URL}/job/${jobName}/${buildNumber}/logText/progressiveText?start=${offset}`,
+      { auth }
+    );
+
+    const logs = response.data || "";
+    const nextOffset = Number(response.headers["x-text-size"] || offset);
+    const moreData = response.headers["x-more-data"] === "true";
+
+    res.json({
+      deploymentId,
+      type,
+      job: jobName,
+      buildNumber,
+      logs,
+      nextOffset,
+      complete: !moreData
+    });
+
+  } catch (err) {
+    console.error("Jenkins logs error:", err.message);
+
+    res.status(500).json({
+      error: "Failed to fetch Jenkins logs"
+    });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const AWS = require("aws-sdk");
+
+const {
+  AWS_REGION,
+  ACCOUNT_C_ROLE_ARN
+} = process.env;
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const sts = new AWS.STS();
+
+/* ================= ASSUME ROLE ================= */
+
+async function assumeAccountCLogs() {
+  const r = await sts.assumeRole({
+    RoleArn: ACCOUNT_C_ROLE_ARN,
+    RoleSessionName: "app-logs-reader"
+  }).promise();
+
+  return new AWS.CloudWatchLogs({
+    region: AWS_REGION,
+    accessKeyId: r.Credentials.AccessKeyId,
+    secretAccessKey: r.Credentials.SecretAccessKey,
+    sessionToken: r.Credentials.SessionToken
+  });
+}
+
+/* ================= HELPERS ================= */
+
+async function getDeployment(deploymentId) {
+  const res = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+
+  return res.Item;
+}
+
+/* Get latest active stream (for EKS) */
+async function getLatestStream(logs, logGroupName) {
+  const data = await logs.describeLogStreams({
+    logGroupName,
+    orderBy: "LastEventTime",
+    descending: true,
+    limit: 1
+  }).promise();
+
+  if (!data.logStreams.length) return null;
+
+  return data.logStreams[0].logStreamName;
+}
+
+/* Stream logs continuously (SSE) */
+async function streamLogEvents(res, logs, logGroupName, logStreamName) {
+  let nextToken = null;
+
+  const interval = setInterval(async () => {
+    try {
+      const params = {
+        logGroupName,
+        logStreamName,
+        startFromHead: false
+      };
+
+      if (nextToken) params.nextToken = nextToken;
+
+      const data = await logs.getLogEvents(params).promise();
+
+      nextToken = data.nextForwardToken;
+
+      for (const event of data.events) {
+        res.write(`data: ${JSON.stringify({
+          timestamp: event.timestamp,
+          message: event.message
+        })}\n\n`);
+      }
+
+    } catch (err) {
+      console.error("Log streaming error:", err.message);
+    }
+  }, 3000);
+
+  res.on("close", () => {
+    clearInterval(interval);
+  });
+}
+
+/* ================= ROUTE ================= */
+/*
+EC2:
+GET /app-logs/:deploymentId?type=access|error
+
+EKS:
+GET /app-logs/:deploymentId
+*/
+
+router.get("/app-logs/:deploymentId", async (req, res) => {
+  const { deploymentId } = req.params;
+  const { type } = req.query;
+
+  try {
+    /* ===== 1. Fetch deployment ===== */
+
+    const deployment = await getDeployment(deploymentId);
+
+    if (!deployment) {
+      return res.status(404).json({ error: "Deployment not found" });
+    }
+
+    if (deployment.status !== "RUNNING") {
+      return res.status(400).json({ error: "Deployment not running" });
+    }
+
+    const runtime = deployment.runtime;
+    let logGroupName;
+
+    /* ================= EC2 ================= */
+
+    if (runtime === "ec2") {
+      if (!type || !["access", "error"].includes(type)) {
+        return res.status(400).json({
+          error: "For EC2, type=access or error is required"
+        });
+      }
+
+      logGroupName =
+        type === "access"
+          ? deployment.logGroupAccess
+          : deployment.logGroupError;
+
+      if (!logGroupName || logGroupName === "NA") {
+        return res.status(400).json({
+          error: "Log group not available for this deployment"
+        });
+      }
+    }
+
+    /* ================= EKS (Fargate / EC2) ================= */
+
+    else if (runtime === "eks-fargate" || runtime === "eks-ec2") {
+      logGroupName = deployment.logGroup;
+
+      if (!logGroupName || logGroupName === "NA") {
+        return res.status(400).json({
+          error: "Log group not available for this deployment"
+        });
+      }
+    }
+
+    else {
+      return res.status(400).json({
+        error: "Unsupported runtime"
+      });
+    }
+
+    /* ===== 2. CloudWatch Client ===== */
+
+    const logs = await assumeAccountCLogs();
+
+    /* ===== 3. Determine stream ===== */
+
+    let logStreamName;
+
+    if (runtime === "ec2") {
+      // EC2 nginx logs → usually single stream
+      const stream = await getLatestStream(logs, logGroupName);
+      if (!stream) {
+        return res.status(404).json({ error: "No log streams found" });
+      }
+      logStreamName = stream;
+    } else {
+      // EKS / Fargate → many pod streams → pick latest
+      const stream = await getLatestStream(logs, logGroupName);
+      if (!stream) {
+        return res.status(404).json({ error: "No active pod streams found" });
+      }
+      logStreamName = stream;
+    }
+
+    /* ===== 4. SSE Headers ===== */
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+
+    res.write(`data: ${JSON.stringify({
+      message: "Streaming logs",
+      deploymentId,
+      runtime,
+      logGroupName,
+      logStreamName
+    })}\n\n`);
+
+    /* ===== 5. Start streaming ===== */
+
+    streamLogEvents(res, logs, logGroupName, logStreamName);
+
+  } catch (err) {
+    console.error("App logs error:", err.message);
+    res.status(500).json({ error: "Failed to fetch logs" });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const AWS = require("aws-sdk");
+
+const { AWS_REGION, ACCOUNT_C_ROLE_ARN } = process.env;
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const sts = new AWS.STS();
+
+/* =========================================================
+   Assume Account C
+========================================================= */
+
+async function assumeAccountC() {
+  const r = await sts.assumeRole({
+    RoleArn: ACCOUNT_C_ROLE_ARN,
+    RoleSessionName: "metrics-reader"
+  }).promise();
+
+  const creds = {
+    accessKeyId: r.Credentials.AccessKeyId,
+    secretAccessKey: r.Credentials.SecretAccessKey,
+    sessionToken: r.Credentials.SessionToken,
+    region: AWS_REGION
+  };
+
+  return {
+    cloudwatch: new AWS.CloudWatch(creds),
+    autoscaling: new AWS.AutoScaling(creds),
+    ec2: new AWS.EC2(creds)
+  };
+}
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+async function getDeployment(deploymentId) {
+  const r = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+
+  return r.Item;
+}
+
+/* =========================================================
+   Time Window (Lifecycle: 0 → 30 mins)
+========================================================= */
+
+function getLifecycleWindow(dep) {
+  if (!dep.completedAt) return null;
+
+  const start = new Date(dep.completedAt);
+  const now = new Date();
+
+  const maxEnd = new Date(start.getTime() + 30 * 60 * 1000);
+  const end = now < maxEnd ? now : maxEnd;
+
+  if (end <= start) return null;
+
+  return { start, end };
+}
+
+/* =========================================================
+   CloudWatch Series Helper
+========================================================= */
+
+async function getAverageSeries(
+  cloudwatch,
+  namespace,
+  metricName,
+  dimensionsList,
+  start,
+  end
+) {
+  if (!dimensionsList.length) return { minutes: [], values: [] };
+
+  const queries = dimensionsList.map((dims, i) => ({
+    Id: `m${i}`,
+    MetricStat: {
+      Metric: {
+        Namespace: namespace,
+        MetricName: metricName,
+        Dimensions: dims
+      },
+      Period: 300,
+      Stat: "Average"
+    }
+  }));
+
+  const r = await cloudwatch.getMetricData({
+    StartTime: start,
+    EndTime: end,
+    MetricDataQueries: queries
+  }).promise();
+
+  const bucketMap = {};
+
+  r.MetricDataResults.forEach(m => {
+    m.Timestamps.forEach((ts, idx) => {
+      const t = new Date(ts).getTime();
+      const v = m.Values[idx];
+
+      if (!bucketMap[t]) bucketMap[t] = [];
+      bucketMap[t].push(v);
+    });
+  });
+
+  const sortedTimes = Object.keys(bucketMap)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  const baseTime = new Date(start).getTime();
+
+  const minutes = [];
+  const values = [];
+
+  sortedTimes.forEach(t => {
+    const arr = bucketMap[t];
+    const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+
+    const minute = Math.round((t - baseTime) / 60000);
+
+    minutes.push(minute);
+    values.push(Number(avg.toFixed(2)));
+  });
+
+  return { minutes, values };
+}
+
+/* =========================================================
+   EC2 Metrics (unchanged)
+========================================================= */
+
+async function getEc2Metrics(dep, clients, start, end) {
+  const { cloudwatch, autoscaling, ec2 } = clients;
+
+  if (!dep.asgName || dep.asgName === "NA") {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const asg = await autoscaling.describeAutoScalingGroups({
+    AutoScalingGroupNames: [dep.asgName]
+  }).promise();
+
+  if (!asg.AutoScalingGroups.length) {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const instanceIds = asg.AutoScalingGroups[0].Instances
+    .filter(i => i.LifecycleState === "InService")
+    .map(i => i.InstanceId);
+
+  if (!instanceIds.length) {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const ec2Data = await ec2.describeInstances({
+    InstanceIds: instanceIds
+  }).promise();
+
+  const hosts = [];
+  ec2Data.Reservations.forEach(r => {
+    r.Instances.forEach(i => {
+      if (i.PrivateDnsName) hosts.push(i.PrivateDnsName);
+    });
+  });
+
+  const cpuSeries = await getAverageSeries(
+    cloudwatch,
+    "AWS/EC2",
+    "CPUUtilization",
+    instanceIds.map(id => [{ Name: "InstanceId", Value: id }]),
+    start,
+    end
+  );
+
+  const memSeries = await getAverageSeries(
+    cloudwatch,
+    "CWAgent",
+    "mem_used_percent",
+    hosts.map(h => [{ Name: "host", Value: h }]),
+    start,
+    end
+  );
+
+  return {
+    minutes: cpuSeries.minutes,
+    cpu: cpuSeries.values,
+    memory: memSeries.values,
+    instanceCount: instanceIds.length
+  };
+}
+
+/* =========================================================
+   EKS-EC2 Metrics (NEW)
+========================================================= */
+
+async function getEksMetrics(dep, cloudwatch, start, end) {
+  if (
+    !dep.clusterName || dep.clusterName === "NA" ||
+    !dep.namespace || dep.namespace === "NA" ||
+    !dep.deploymentName || dep.deploymentName === "NA"
+  ) {
+    return { minutes: [], cpu: [], memory: [] };
+  }
+
+  const dimensions = [
+    {
+      Name: "ClusterName",
+      Value: dep.clusterName
+    },
+    {
+      Name: "Namespace",
+      Value: dep.namespace
+    }
+  ];
+
+  const cpuSeries = await getAverageSeries(
+    cloudwatch,
+    "ContainerInsights",
+    "pod_cpu_utilization",
+    [dimensions],
+    start,
+    end
+  );
+
+  const memSeries = await getAverageSeries(
+    cloudwatch,
+    "ContainerInsights",
+    "pod_memory_utilization",
+    [dimensions],
+    start,
+    end
+  );
+
+  return {
+    minutes: cpuSeries.minutes,
+    cpu: cpuSeries.values,
+    memory: memSeries.values
+  };
+}
+
+/* =========================================================
+   Route
+========================================================= */
+
+router.get("/metrics/:deploymentId", async (req, res) => {
+  try {
+    const { deploymentId } = req.params;
+
+    const dep = await getDeployment(deploymentId);
+
+    if (!dep) {
+      return res.status(404).json({ error: "Deployment not found" });
+    }
+
+    if (!dep.metricsEnabled) {
+      return res.json({
+        deploymentId,
+        metricsEnabled: false
+      });
+    }
+
+    if (!dep.completedAt) {
+      return res.json({
+        deploymentId,
+        message: "Metrics not available yet"
+      });
+    }
+
+    const window = getLifecycleWindow(dep);
+    if (!window) {
+      return res.json({
+        deploymentId,
+        minutes: [],
+        cpu: [],
+        memory: []
+      });
+    }
+
+    const clients = await assumeAccountC();
+
+    /* ===== EC2 ===== */
+    if (dep.metricsType === "ec2") {
+      const data = await getEc2Metrics(dep, clients, window.start, window.end);
+
+      return res.json({
+        deploymentId,
+        runtime: dep.runtime,
+        metricsType: "ec2",
+        ...data
+      });
+    }
+
+    /* ===== EKS-EC2 ===== */
+    if (dep.metricsType === "eks") {
+      const data = await getEksMetrics(
+        dep,
+        clients.cloudwatch,
+        window.start,
+        window.end
+      );
+
+      return res.json({
+        deploymentId,
+        runtime: dep.runtime,
+        metricsType: "eks",
+        ...data
+      });
+    }
+
+    return res.json({
+      deploymentId,
+      metricsEnabled: false
+    });
+
+  } catch (err) {
+    console.error("Metrics error:", err.message);
+    res.status(500).json({ error: "Failed to fetch metrics" });
+  }
+});
+
+module.exports = router;
+const router = require("express").Router();
+const axios = require("axios");
+const AWS = require("aws-sdk");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION,
+  ACCOUNT_C_ROLE_ARN
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const sts = new AWS.STS();
+
+/* ================= SSE ================= */
+
+function setSseHeaders(res) {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+  res.flushHeaders();
+}
+
+/* ================= HELPERS ================= */
+
+async function assumeLogs() {
+  const r = await sts.assumeRole({
+    RoleArn: ACCOUNT_C_ROLE_ARN,
+    RoleSessionName: "logs-sse"
+  }).promise();
+
+  return new AWS.CloudWatchLogs({
+    region: AWS_REGION,
+    accessKeyId: r.Credentials.AccessKeyId,
+    secretAccessKey: r.Credentials.SecretAccessKey,
+    sessionToken: r.Credentials.SessionToken
+  });
+}
+
+async function getDeployment(deploymentId) {
+  const r = await dynamodb.get({
+    TableName: "Deployments",
+    Key: { deploymentId }
+  }).promise();
+  return r.Item;
+}
+
+/* ================= JENKINS STREAM ================= */
+
+async function streamJenkins({ res, jobName, buildNumber, eventName }) {
+  let offset = 0;
+  let stopped = false;
+
+  const interval = setInterval(async () => {
+    if (stopped) return;
+
+    try {
+      const r = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/logText/progressiveText?start=${offset}`,
+        { auth }
+      );
+
+      const text = r.data || "";
+      offset = Number(r.headers["x-text-size"] || offset);
+      const complete = r.headers["x-more-data"] !== "true";
+
+      if (text) {
+        res.write(`event: ${eventName}\ndata: ${text.replace(/\n/g, "\ndata: ")}\n\n`);
+      }
+
+      if (complete) {
+        res.write(`event: ${eventName}-complete\ndata: finished\n\n`);
+        clearInterval(interval);
+      }
+
+    } catch (e) {
+      res.write(`event: error\ndata: Jenkins error ${e.message}\n\n`);
+    }
+  }, 3000);
+
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
+}
+
+/* ================= CLOUDWATCH HELPERS ================= */
+
+async function getLatestStream(logs, logGroupName) {
+  const data = await logs.describeLogStreams({
+    logGroupName,
+    orderBy: "LastEventTime",
+    descending: true,
+    limit: 1
+  }).promise();
+
+  if (!data.logStreams.length) return null;
+  return data.logStreams[0].logStreamName;
+}
+
+/* ================= EC2 STREAM ================= */
+
+async function streamEc2Logs({ res, logs, accessGroup, errorGroup }) {
+  let stopped = false;
+  let startTime = Date.now() - 5 * 60 * 1000;
+
+  const interval = setInterval(async () => {
+    if (stopped) return;
+
+    try {
+      for (const [eventName, group] of [
+        ["access", accessGroup],
+        ["error", errorGroup]
+      ]) {
+        if (!group || group === "NA") continue;
+
+        const r = await logs.filterLogEvents({
+          logGroupName: group,
+          startTime,
+          limit: 50
+        }).promise();
+
+        for (const e of r.events || []) {
+          res.write(`event: ${eventName}\ndata: ${e.message}\n\n`);
+          startTime = Math.max(startTime, e.timestamp + 1);
+        }
+      }
+    } catch (e) {
+      res.write(`event: error\ndata: EC2 logs error ${e.message}\n\n`);
+    }
+  }, 4000);
+
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
+}
+
+/* ================= EKS STREAM ================= */
+/* FINAL WORKING FIX */
+
+async function streamEksLogs({ res, logs, logGroup }) {
+  let stopped = false;
+
+  const streamName = await getLatestStream(logs, logGroup);
+  if (!streamName) return () => {};
+
+  let nextToken = null;
+
+  const interval = setInterval(async () => {
+    if (stopped) return;
+
+    try {
+      const params = {
+        logGroupName: logGroup,
+        logStreamName: streamName,
+        startFromHead: false
+      };
+
+      if (nextToken) params.nextToken = nextToken;
+
+      const data = await logs.getLogEvents(params).promise();
+      nextToken = data.nextForwardToken;
+
+      for (const e of data.events) {
+        let message = e.message;
+
+        // Extract nginx log from EKS JSON
+        try {
+          const parsed = JSON.parse(e.message);
+          if (parsed.log) {
+            message = parsed.log;
+          }
+        } catch {}
+
+        message = message
+          .replace(/\r/g, "")
+          .replace(/\n/g, "")
+          .trim();
+
+        // IMPORTANT: embed prefix so frontend coloring works
+        res.write(`event: access\ndata: event: access ${message}\n\n`);
+      }
+
+    } catch (e) {
+      res.write(`event: error\ndata: EKS logs error ${e.message}\n\n`);
+    }
+  }, 4000);
+
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
+}
+
+/* ================= MAIN ROUTE ================= */
+
+router.get("/logs/stream", async (req, res) => {
+  const { deploymentId } = req.query;
+
+  if (!deploymentId) {
+    return res.status(400).json({ error: "deploymentId required" });
+  }
+
+  setSseHeaders(res);
+
+  let stopCurrent = null;
+  let currentMode = null;
+  const logsClient = await assumeLogs();
+
+  const loop = setInterval(async () => {
+    try {
+      const dep = await getDeployment(deploymentId);
+      if (!dep) return;
+
+      let nextMode = null;
+      let starter = null;
+
+      if (dep.status === "DEPLOYING" && dep.deployBuildNumber !== "NA") {
+        nextMode = "deploy";
+        starter = () =>
+          streamJenkins({
+            res,
+            jobName: dep.deployJobName,
+            buildNumber: dep.deployBuildNumber,
+            eventName: "deploy"
+          });
+      }
+
+      else if (dep.status === "DESTROYING" && dep.destroyBuildNumber !== "NA") {
+        nextMode = "destroy";
+        starter = () =>
+          streamJenkins({
+            res,
+            jobName: dep.destroyJobName,
+            buildNumber: dep.destroyBuildNumber,
+            eventName: "destroy"
+          });
+      }
+
+      else if (dep.status === "RUNNING") {
+        if (dep.runtime === "ec2") {
+          nextMode = "ec2";
+          starter = () =>
+            streamEc2Logs({
+              res,
+              logs: logsClient,
+              accessGroup: dep.logGroupAccess,
+              errorGroup: dep.logGroupError
+            });
+        }
+
+        else if (dep.runtime === "eks-fargate" || dep.runtime === "eks-ec2") {
+          nextMode = "eks";
+          starter = () =>
+            streamEksLogs({
+              res,
+              logs: logsClient,
+              logGroup: dep.logGroup
+            });
+        }
+      }
+
+      if (nextMode !== currentMode) {
+        if (stopCurrent) stopCurrent();
+        currentMode = nextMode;
+        if (starter) stopCurrent = await starter();
+      }
+
+    } catch (e) {
+      res.write(`event: error\ndata: ${e.message}\n\n`);
+    }
+  }, 3000);
+
+  req.on("close", () => {
+    clearInterval(loop);
+    if (stopCurrent) stopCurrent();
+    res.end();
+  });
+});
+
+module.exports = router;
+const express = require("express");
+const AWS = require("aws-sdk");
+
+const router = express.Router();
+
+const { AWS_REGION } = process.env;
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/*
+GET /application-url/:deploymentId
+
+Returns application endpoint (ALB / Ingress)
+*/
+
+router.get("/application-url/:deploymentId", async (req, res) => {
+  const { deploymentId } = req.params;
+
+  try {
+    /* ===== 1. Fetch deployment ===== */
+
+    const result = await dynamodb.get({
+      TableName: "Deployments",
+      Key: { deploymentId }
+    }).promise();
+
+    const deployment = result.Item;
+
+    if (!deployment) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    const {
+      status,
+      endpointUrl,
+      runtime,
+      appId,
+      appName,
+      completedAt
+    } = deployment;
+
+    /* ===== 2. Handle status cases ===== */
+
+    if (status === "FAILED") {
+      return res.status(400).json({
+        error: "Deployment failed",
+        status
+      });
+    }
+
+    if (status === "DESTROYED") {
+      return res.status(400).json({
+        error: "Application destroyed",
+        status
+      });
+    }
+
+    if (status === "QUEUED" || status === "DEPLOYING") {
+      return res.status(409).json({
+        error: "Application not ready yet",
+        status,
+        completedAt: completedAt || null
+      });
+    }
+
+    /* ===== 3. RUNNING but endpoint not yet recorded ===== */
+
+    if (!endpointUrl || endpointUrl === "NA") {
+      return res.status(409).json({
+        error: "Endpoint not available yet",
+        status,
+        completedAt: completedAt || null
+      });
+    }
+
+    /* ===== 4. Success ===== */
+
+    res.json({
+      deploymentId,
+      appId,
+      appName,
+      runtime,
+      url: endpointUrl,
+      status,
+      completedAt: completedAt || null
+    });
+
+  } catch (err) {
+    console.error("application-url error:", err.message);
+    res.status(500).json({
+      error: "Failed to fetch application URL"
+    });
+  }
+});
+
+module.exports = router;
+const axios = require("axios");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+function wait(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/* =======================================================
+   Extract values from Jenkins console output
+   Now supports OBS_* format printed by pipeline
+======================================================= */
+
+function extractValue(logs, key) {
+  const match = logs.match(new RegExp(`${key}=(.*)`));
+  return match ? match[1].trim() : "NA";
+}
+
+async function extractDeploymentInfo(jobName, buildNumber, runtime) {
+  try {
+    const logRes = await axios.get(
+      `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
+      { auth }
+    );
+
+    const logs = logRes.data;
+
+    /* ===================================================
+       Read OBS values (printed by Jenkins)
+    =================================================== */
+
+    const info = {
+      endpointUrl: extractValue(logs, "OBS_ENDPOINT"),
+
+      logGroupAccess: extractValue(logs, "OBS_LOG_GROUP_ACCESS"),
+      logGroupError: extractValue(logs, "OBS_LOG_GROUP_ERROR"),
+      logGroup: extractValue(logs, "OBS_LOG_GROUP"),
+
+      asgName: extractValue(logs, "OBS_ASG"),
+
+      clusterName: extractValue(logs, "OBS_CLUSTER"),
+      namespace: extractValue(logs, "OBS_NAMESPACE"),
+      deploymentName: extractValue(logs, "OBS_DEPLOYMENT"),
+
+      metricsEnabled:
+        extractValue(logs, "OBS_METRICS_ENABLED") === "true",
+
+      metricsType: extractValue(logs, "OBS_METRICS_TYPE")
+    };
+
+    /* ===================================================
+       Runtime safety defaults
+    =================================================== */
+
+    if (runtime === "ec2") {
+      info.metricsEnabled = true;
+      info.metricsType = "ec2";
+    }
+
+    if (runtime === "eks-fargate") {
+      info.metricsEnabled = false;
+      info.metricsType = "NA";
+    }
+
+    if (runtime === "eks-ec2") {
+      info.metricsEnabled = true;
+      info.metricsType = "eks";
+    }
+
+    return info;
+
+  } catch (err) {
+    console.error("Console parsing failed:", err.message);
+    return {};
+  }
+}
+
+/* =======================================================
+   Deployment Watcher
+======================================================= */
+
+async function watchDeployment({
+  deploymentId,
+  jobName,
+  buildNumber,
+  runtime,
+  updateDeployment
+}) {
+  console.log("Deploy watcher started:", deploymentId);
+
+  while (true) {
+    try {
+      const buildRes = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+        { auth }
+      );
+
+      /* ---------- Wait until build finishes ---------- */
+      if (!buildRes.data.building) {
+        const result = buildRes.data.result || "FAILED";
+
+        /* ---------- FAILED ---------- */
+        if (result !== "SUCCESS") {
+          await updateDeployment(deploymentId, {
+            status: "FAILED",
+            completedAt: new Date().toISOString(),
+            deployBuildNumber: buildNumber
+          });
+
+          console.log("Deployment FAILED:", deploymentId);
+          break;
+        }
+
+        /* ---------- SUCCESS ---------- */
+
+        const info = await extractDeploymentInfo(
+          jobName,
+          buildNumber,
+          runtime
+        );
+
+        const payload = {
+          status: "RUNNING",
+          completedAt: new Date().toISOString(),
+          deployBuildNumber: buildNumber,
+
+          endpointUrl: info.endpointUrl || "NA",
+
+          logGroupAccess: info.logGroupAccess || "NA",
+          logGroupError: info.logGroupError || "NA",
+          logGroup: info.logGroup || "NA",
+
+          metricsEnabled:
+            typeof info.metricsEnabled === "boolean"
+              ? info.metricsEnabled
+              : false,
+
+          metricsType: info.metricsType || "NA",
+
+          asgName: info.asgName || "NA",
+
+          clusterName: info.clusterName || "NA",
+          namespace: info.namespace || "NA",
+          deploymentName: info.deploymentName || "NA"
+        };
+
+        console.log("Deployment SUCCESS update:", payload);
+
+        await updateDeployment(deploymentId, payload);
+        break;
+      }
+
+    } catch (err) {
+      console.error("Watcher error:", err.message);
+    }
+
+    await wait(10000);
+  }
+}
+
+module.exports = { watchDeployment };
+const AWS = require("aws-sdk");
+const axios = require("axios");
+
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
+
+AWS.config.update({ region: AWS_REGION || "us-east-1" });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const AUTO_DESTROY_AFTER_MS = 30 * 60 * 1000; // 30 min
+const CHECK_INTERVAL_MS = 60 * 1000;
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+function wait(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function getBuildNumberFromQueue(queueUrl) {
+  while (true) {
+    const q = await axios.get(`${queueUrl}api/json`, { auth });
+    if (q.data.executable?.number) return q.data.executable.number;
+    await wait(1000);
+  }
+}
+
+async function updateDeployment(deploymentId, data) {
+  const updates = [];
+  const values = {};
+  const names = {};
+
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined || v === null) continue;
+    updates.push(`#${k} = :${k}`);
+    values[`:${k}`] = v;
+    names[`#${k}`] = k;
+  }
+
+  if (!updates.length) return;
+
+  await dynamodb.update({
+    TableName: "Deployments",
+    Key: { deploymentId },
+    UpdateExpression: "SET " + updates.join(", "),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values
+  }).promise();
+}
+
+async function watchDestroy({ jobName, buildNumber, deploymentId }) {
+  while (true) {
+    try {
+      const r = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+        { auth }
+      );
+
+      if (!r.data.building) {
+        const success = r.data.result === "SUCCESS";
+
+        await updateDeployment(deploymentId, {
+          status: success ? "DESTROYED" : "FAILED",
+          destroyedAt: success ? new Date().toISOString() : "NA"
+        });
+
+        break;
+      }
+    } catch (err) {
+      console.error("Destroy watcher error:", err.message);
+    }
+
+    await wait(5000);
+  }
+}
+
+/* =========================================================
+   Scan logic
+========================================================= */
+
+async function scanEligibleDeployments() {
+  const now = Date.now();
+
+  const res = await dynamodb.scan({
+    TableName: "Deployments",
+    FilterExpression: "#s = :running",
+    ExpressionAttributeNames: {
+      "#s": "status"
+    },
+    ExpressionAttributeValues: {
+      ":running": "RUNNING"
+    }
+  }).promise();
+
+  for (const dep of res.Items || []) {
+    if (!dep.completedAt || dep.completedAt === "NA") continue;
+    if (dep.destroyedAt && dep.destroyedAt !== "NA") continue;
+
+    const completedTime = new Date(dep.completedAt).getTime();
+    if (isNaN(completedTime)) continue;
+
+    if (now - completedTime < AUTO_DESTROY_AFTER_MS) continue;
+
+    console.log("⏳ Auto-destroy:", dep.deploymentId);
+
+    try {
+      const trigger = await axios.post(
+        `${JENKINS_URL}/job/${dep.destroyJobName}/buildWithParameters`,
+        null,
+        {
+          auth,
+          params: {
+            DESTROY_TARGET: dep.runtime
+          }
+        }
+      );
+
+      const buildNumber = await getBuildNumberFromQueue(
+        trigger.headers.location
+      );
+
+      await updateDeployment(dep.deploymentId, {
+        status: "DESTROYING",
+        destroyBuildNumber: buildNumber
+      });
+
+      watchDestroy({
+        jobName: dep.destroyJobName,
+        buildNumber,
+        deploymentId: dep.deploymentId
+      });
+
+    } catch (err) {
+      console.error("❌ Auto-destroy failed:", err.message);
+    }
+  }
+}
+
+/* =========================================================
+   Starter
+========================================================= */
+
+function startAutoDestroyWorker() {
+  console.log("🚀 Auto-destroy worker started");
+
+  setInterval(() => {
+    scanEligibleDeployments().catch(err =>
+      console.error("Scan error:", err.message)
+    );
+  }, CHECK_INTERVAL_MS);
+}
+
+module.exports = startAutoDestroyWorker;

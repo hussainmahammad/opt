@@ -8,127 +8,313 @@ AWS.config.update({ region: AWS_REGION || "us-east-1" });
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const sts = new AWS.STS();
 
-/* ---------- helpers ---------- */
+/* =========================================================
+   Assume Account C
+========================================================= */
 
 async function assumeAccountC() {
   const r = await sts.assumeRole({
     RoleArn: ACCOUNT_C_ROLE_ARN,
-    RoleSessionName: "backend-metrics"
+    RoleSessionName: "metrics-reader"
   }).promise();
 
-  return new AWS.CloudWatch({
-    region: AWS_REGION,
+  const creds = {
     accessKeyId: r.Credentials.AccessKeyId,
     secretAccessKey: r.Credentials.SecretAccessKey,
-    sessionToken: r.Credentials.SessionToken
-  });
+    sessionToken: r.Credentials.SessionToken,
+    region: AWS_REGION
+  };
+
+  return {
+    cloudwatch: new AWS.CloudWatch(creds),
+    autoscaling: new AWS.AutoScaling(creds),
+    ec2: new AWS.EC2(creds)
+  };
 }
 
-async function getLatestDeployment(appId) {
-  const r = await dynamodb.scan({
+/* =========================================================
+   Helpers
+========================================================= */
+
+async function getDeployment(deploymentId) {
+  const r = await dynamodb.get({
     TableName: "Deployments",
-    FilterExpression: "appId = :a",
-    ExpressionAttributeValues: { ":a": appId }
+    Key: { deploymentId }
   }).promise();
 
-  if (!r.Items || r.Items.length === 0) return null;
-
-  return r.Items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+  return r.Item;
 }
 
-/* ---------- route ---------- */
+/* =========================================================
+   Time Window (Lifecycle: 0 → 30 mins)
+========================================================= */
 
-router.get("/metrics/:appId", async (req, res) => {
+function getLifecycleWindow(dep) {
+  if (!dep.completedAt) return null;
+
+  const start = new Date(dep.completedAt);
+  const now = new Date();
+
+  const maxEnd = new Date(start.getTime() + 30 * 60 * 1000);
+  const end = now < maxEnd ? now : maxEnd;
+
+  if (end <= start) return null;
+
+  return { start, end };
+}
+
+/* =========================================================
+   CloudWatch Series Helper
+========================================================= */
+
+async function getAverageSeries(
+  cloudwatch,
+  namespace,
+  metricName,
+  dimensionsList,
+  start,
+  end
+) {
+  if (!dimensionsList.length) return { minutes: [], values: [] };
+
+  const queries = dimensionsList.map((dims, i) => ({
+    Id: `m${i}`,
+    MetricStat: {
+      Metric: {
+        Namespace: namespace,
+        MetricName: metricName,
+        Dimensions: dims
+      },
+      Period: 300,
+      Stat: "Average"
+    }
+  }));
+
+  const r = await cloudwatch.getMetricData({
+    StartTime: start,
+    EndTime: end,
+    MetricDataQueries: queries
+  }).promise();
+
+  const bucketMap = {};
+
+  r.MetricDataResults.forEach(m => {
+    m.Timestamps.forEach((ts, idx) => {
+      const t = new Date(ts).getTime();
+      const v = m.Values[idx];
+
+      if (!bucketMap[t]) bucketMap[t] = [];
+      bucketMap[t].push(v);
+    });
+  });
+
+  const sortedTimes = Object.keys(bucketMap)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  const baseTime = new Date(start).getTime();
+
+  const minutes = [];
+  const values = [];
+
+  sortedTimes.forEach(t => {
+    const arr = bucketMap[t];
+    const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+
+    const minute = Math.round((t - baseTime) / 60000);
+
+    minutes.push(minute);
+    values.push(Number(avg.toFixed(2)));
+  });
+
+  return { minutes, values };
+}
+
+/* =========================================================
+   EC2 Metrics (unchanged)
+========================================================= */
+
+async function getEc2Metrics(dep, clients, start, end) {
+  const { cloudwatch, autoscaling, ec2 } = clients;
+
+  if (!dep.asgName || dep.asgName === "NA") {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const asg = await autoscaling.describeAutoScalingGroups({
+    AutoScalingGroupNames: [dep.asgName]
+  }).promise();
+
+  if (!asg.AutoScalingGroups.length) {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const instanceIds = asg.AutoScalingGroups[0].Instances
+    .filter(i => i.LifecycleState === "InService")
+    .map(i => i.InstanceId);
+
+  if (!instanceIds.length) {
+    return { minutes: [], cpu: [], memory: [], instanceCount: 0 };
+  }
+
+  const ec2Data = await ec2.describeInstances({
+    InstanceIds: instanceIds
+  }).promise();
+
+  const hosts = [];
+  ec2Data.Reservations.forEach(r => {
+    r.Instances.forEach(i => {
+      if (i.PrivateDnsName) hosts.push(i.PrivateDnsName);
+    });
+  });
+
+  const cpuSeries = await getAverageSeries(
+    cloudwatch,
+    "AWS/EC2",
+    "CPUUtilization",
+    instanceIds.map(id => [{ Name: "InstanceId", Value: id }]),
+    start,
+    end
+  );
+
+  const memSeries = await getAverageSeries(
+    cloudwatch,
+    "CWAgent",
+    "mem_used_percent",
+    hosts.map(h => [{ Name: "host", Value: h }]),
+    start,
+    end
+  );
+
+  return {
+    minutes: cpuSeries.minutes,
+    cpu: cpuSeries.values,
+    memory: memSeries.values,
+    instanceCount: instanceIds.length
+  };
+}
+
+/* =========================================================
+   EKS-EC2 Metrics (NEW)
+========================================================= */
+
+async function getEksMetrics(dep, cloudwatch, start, end) {
+  if (
+    !dep.clusterName || dep.clusterName === "NA" ||
+    !dep.namespace || dep.namespace === "NA" ||
+    !dep.deploymentName || dep.deploymentName === "NA"
+  ) {
+    return { minutes: [], cpu: [], memory: [] };
+  }
+
+  const dimensions = [
+    {
+      Name: "ClusterName",
+      Value: dep.clusterName
+    },
+    {
+      Name: "Namespace",
+      Value: dep.namespace
+    }
+  ];
+
+  const cpuSeries = await getAverageSeries(
+    cloudwatch,
+    "ContainerInsights",
+    "pod_cpu_utilization",
+    [dimensions],
+    start,
+    end
+  );
+
+  const memSeries = await getAverageSeries(
+    cloudwatch,
+    "ContainerInsights",
+    "pod_memory_utilization",
+    [dimensions],
+    start,
+    end
+  );
+
+  return {
+    minutes: cpuSeries.minutes,
+    cpu: cpuSeries.values,
+    memory: memSeries.values
+  };
+}
+
+/* =========================================================
+   Route
+========================================================= */
+
+router.get("/metrics/:deploymentId", async (req, res) => {
   try {
-    const { appId } = req.params;
+    const { deploymentId } = req.params;
 
-    const dep = await getLatestDeployment(appId);
-    if (!dep) return res.status(404).json({ error: "No deployment found for app" });
+    const dep = await getDeployment(deploymentId);
 
-    const { instanceId, host, createdAt } = dep;
-    if (!instanceId || !host || !createdAt) {
-      return res.status(400).json({ error: "Deployment missing instance data" });
+    if (!dep) {
+      return res.status(404).json({ error: "Deployment not found" });
     }
 
-    const cloudwatch = await assumeAccountC();
-
-    // normalize createdAt (string or number)
-    const deployTime = typeof createdAt === "number"
-      ? createdAt
-      : new Date(createdAt).getTime();
-
-    if (isNaN(deployTime)) {
-      return res.status(400).json({ error: "Invalid createdAt timestamp" });
+    if (!dep.metricsEnabled) {
+      return res.json({
+        deploymentId,
+        metricsEnabled: false
+      });
     }
 
-    const FIVE_MIN = 5 * 60 * 1000;
-
-    const buckets = [];
-    for (let i = 1; i <= 6; i++) {
-      buckets.push(deployTime + i * FIVE_MIN);
+    if (!dep.completedAt) {
+      return res.json({
+        deploymentId,
+        message: "Metrics not available yet"
+      });
     }
 
-    const m = await cloudwatch.getMetricData({
-      StartTime: new Date(deployTime),
-      EndTime: new Date(deployTime + 6 * FIVE_MIN),
-      MetricDataQueries: [
-        {
-          Id: "cpu",
-          MetricStat: {
-            Metric: {
-              Namespace: "AWS/EC2",
-              MetricName: "CPUUtilization",
-              Dimensions: [{ Name: "InstanceId", Value: instanceId }]
-            },
-            Period: 300,
-            Stat: "Average"
-          }
-        },
-        {
-          Id: "mem",
-          MetricStat: {
-            Metric: {
-              Namespace: "CWAgent",
-              MetricName: "mem_used_percent",
-              Dimensions: [{ Name: "host", Value: host }]
-            },
-            Period: 300,
-            Stat: "Average"
-          }
-        }
-      ]
-    }).promise();
-
-    function bucketizeGrowing(result) {
-      if (!result || !result.Timestamps) return [];
-
-      const pairs = result.Timestamps.map((t, i) => ({
-        t: new Date(t).getTime(),
-        v: Number(result.Values[i].toFixed(2))
-      }));
-
-      pairs.sort((a, b) => a.t - b.t);
-
-      const out = [];
-
-      for (let b = 0; b < buckets.length; b++) {
-        const start = buckets[b] - FIVE_MIN;
-        const end = buckets[b];
-
-        const found = pairs.find(p => p.t >= start && p.t < end);
-        if (found) out.push(found.v);
-        else break;
-      }
-
-      return out;
+    const window = getLifecycleWindow(dep);
+    if (!window) {
+      return res.json({
+        deploymentId,
+        minutes: [],
+        cpu: [],
+        memory: []
+      });
     }
 
-    const cpuResult = m.MetricDataResults.find(x => x.Id === "cpu");
-    const memResult = m.MetricDataResults.find(x => x.Id === "mem");
+    const clients = await assumeAccountC();
 
-    res.json({
-      cpu: bucketizeGrowing(cpuResult),
-      memory: bucketizeGrowing(memResult)
+    /* ===== EC2 ===== */
+    if (dep.metricsType === "ec2") {
+      const data = await getEc2Metrics(dep, clients, window.start, window.end);
+
+      return res.json({
+        deploymentId,
+        runtime: dep.runtime,
+        metricsType: "ec2",
+        ...data
+      });
+    }
+
+    /* ===== EKS-EC2 ===== */
+    if (dep.metricsType === "eks") {
+      const data = await getEksMetrics(
+        dep,
+        clients.cloudwatch,
+        window.start,
+        window.end
+      );
+
+      return res.json({
+        deploymentId,
+        runtime: dep.runtime,
+        metricsType: "eks",
+        ...data
+      });
+    }
+
+    return res.json({
+      deploymentId,
+      metricsEnabled: false
     });
 
   } catch (err) {

@@ -2,54 +2,158 @@ const router = require("express").Router();
 const axios = require("axios");
 const AWS = require("aws-sdk");
 
-const { JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN, AWS_REGION } = process.env;
-const auth = { username: JENKINS_USER, password: JENKINS_API_TOKEN };
+const {
+  JENKINS_URL,
+  JENKINS_USER,
+  JENKINS_API_TOKEN,
+  AWS_REGION
+} = process.env;
+
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
 
 AWS.config.update({ region: AWS_REGION || "us-east-1" });
 const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+/* =========================================================
+   Helpers
+========================================================= */
 
 function normalize(status) {
   if (status === "IN_PROGRESS") return "RUNNING";
   if (status === "SUCCESS") return "COMPLETED";
   if (status === "FAILED") return "FAILED";
+  if (status === "ABORTED") return "FAILED";
   return "PENDING";
 }
 
-router.get("/phases/:appId", async (req, res) => {
+const UI_PHASES = [
+  "Prepare",
+  "Build",
+  "Setup",
+  "Deploy",
+  "Validate",
+  "Complete"
+];
+
+/*
+GET /phases/:deploymentId?type=deploy|destroy
+*/
+
+router.get("/phases/:deploymentId", async (req, res) => {
   try {
-    const { appId } = req.params;
+    const { deploymentId } = req.params;
     const type = req.query.type || "deploy";
 
-    const appRes = await dynamodb.get({
-      TableName: "Applications",
-      Key: { appId }
+    /* ===== 1. Validate type ===== */
+
+    if (!["deploy", "destroy"].includes(type)) {
+      return res.status(400).json({
+        error: "type must be deploy or destroy"
+      });
+    }
+
+    /* ===== 2. Fetch deployment ===== */
+
+    const depRes = await dynamodb.get({
+      TableName: "Deployments",
+      Key: { deploymentId }
     }).promise();
 
-    if (!appRes.Item) return res.status(404).json({ error: "App not found" });
+    if (!depRes.Item) {
+      return res.status(404).json({
+        error: "Deployment not found"
+      });
+    }
+
+    const deployment = depRes.Item;
+
+    /* ===== 3. Select job & build ===== */
 
     const jobName =
       type === "destroy"
-        ? appRes.Item.destroyJobName
-        : appRes.Item.deployJobName;
+        ? deployment.destroyJobName
+        : deployment.deployJobName;
 
-    const wf = await axios.get(
-      `${JENKINS_URL}/job/${jobName}/lastBuild/wfapi/describe`,
-      { auth }
-    );
+    const buildNumber =
+      type === "destroy"
+        ? deployment.destroyBuildNumber
+        : deployment.deployBuildNumber;
 
-    const UI_PHASES = ["Prepare", "Build", "Setup", "Deploy", "Validate", "Complete"];
-    const phases = UI_PHASES.map(p => ({ name: p, status: "PENDING" }));
+    /* ===== 4. Build not started ===== */
 
-    wf.data.stages.forEach(stage => {
-      const i = UI_PHASES.indexOf(stage.name);
-      if (i !== -1) phases[i].status = normalize(stage.status);
+    if (!buildNumber || buildNumber === "NA") {
+      return res.json({
+        deploymentId,
+        type,
+        job: jobName,
+        buildNumber: null,
+        phases: UI_PHASES.map(p => ({
+          name: p,
+          status: "PENDING"
+        })),
+        message: "Build not started yet"
+      });
+    }
+
+    /* ===== 5. Fetch Jenkins stages ===== */
+
+    let stages = [];
+
+    try {
+      const wf = await axios.get(
+        `${JENKINS_URL}/job/${jobName}/${buildNumber}/wfapi/describe`,
+        { auth }
+      );
+
+      stages = wf.data.stages || [];
+    } catch (e) {
+      // wfapi may not be ready yet
+      return res.json({
+        deploymentId,
+        type,
+        job: jobName,
+        buildNumber,
+        phases: UI_PHASES.map(p => ({
+          name: p,
+          status: "PENDING"
+        })),
+        message: "Stages not available yet"
+      });
+    }
+
+    /* ===== 6. Map to UI phases ===== */
+
+    const phases = UI_PHASES.map(p => ({
+      name: p,
+      status: "PENDING"
+    }));
+
+    stages.forEach(stage => {
+      const idx = UI_PHASES.indexOf(stage.name);
+      if (idx !== -1) {
+        phases[idx].status = normalize(stage.status);
+      }
     });
 
-    res.json({ appId, type, job: jobName, phases });
+    /* ===== 7. Response ===== */
+
+    res.json({
+      deploymentId,
+      type,
+      job: jobName,
+      buildNumber,
+      phases
+    });
 
   } catch (err) {
     console.error("Phases error:", err.message);
-    res.status(500).json({ error: "Failed to fetch phases" });
+
+    res.status(500).json({
+      error: "Failed to fetch phases"
+    });
   }
 });
 

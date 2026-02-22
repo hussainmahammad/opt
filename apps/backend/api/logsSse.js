@@ -10,30 +10,33 @@ const {
   ACCOUNT_C_ROLE_ARN
 } = process.env;
 
-const auth = { username: JENKINS_USER, password: JENKINS_API_TOKEN };
+const auth = {
+  username: JENKINS_USER,
+  password: JENKINS_API_TOKEN
+};
 
 AWS.config.update({ region: AWS_REGION || "us-east-1" });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const sts = new AWS.STS();
 
-/* ================= SSE HEADERS ================= */
+/* ================= SSE ================= */
 
 function setSseHeaders(res) {
   res.set({
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
+    Connection: "keep-alive"
   });
   res.flushHeaders();
 }
 
 /* ================= HELPERS ================= */
 
-async function assumeAccountCLogs() {
+async function assumeLogs() {
   const r = await sts.assumeRole({
     RoleArn: ACCOUNT_C_ROLE_ARN,
-    RoleSessionName: "sse-app-logs"
+    RoleSessionName: "logs-sse"
   }).promise();
 
   return new AWS.CloudWatchLogs({
@@ -45,30 +48,18 @@ async function assumeAccountCLogs() {
 }
 
 async function getDeployment(deploymentId) {
-  const res = await dynamodb.get({
+  const r = await dynamodb.get({
     TableName: "Deployments",
     Key: { deploymentId }
   }).promise();
-
-  return res.Item || null;
+  return r.Item;
 }
 
-/* ================= STREAMERS ================= */
+/* ================= JENKINS STREAM ================= */
 
-async function streamJenkinsLogs({ res, jobName, jobType }) {
+async function streamJenkins({ res, jobName, buildNumber, eventName }) {
   let offset = 0;
   let stopped = false;
-
-  const jobInfo = await axios.get(`${JENKINS_URL}/job/${jobName}/api/json`, { auth });
-  const last = jobInfo.data.lastBuild;
-  const lastCompleted = jobInfo.data.lastCompletedBuild;
-
-  if (!last || !lastCompleted || last.number === lastCompleted.number) {
-    res.write(`event: idle\ndata: No active pipeline\n\n`);
-    return;
-  }
-
-  const buildNumber = last.number;
 
   const interval = setInterval(async () => {
     if (stopped) return;
@@ -80,24 +71,21 @@ async function streamJenkinsLogs({ res, jobName, jobType }) {
       );
 
       const text = r.data || "";
-      const nextOffset = Number(r.headers["x-text-size"] || offset);
+      offset = Number(r.headers["x-text-size"] || offset);
       const complete = r.headers["x-more-data"] !== "true";
 
       if (text) {
-        res.write(`event: ${jobType}\ndata: ${text.replace(/\n/g, "\ndata: ")}\n\n`);
+        res.write(`event: ${eventName}\ndata: ${text.replace(/\n/g, "\ndata: ")}\n\n`);
       }
 
-      offset = nextOffset;
-
       if (complete) {
-        res.write(`event: complete\ndata: Pipeline finished\n\n`);
+        res.write(`event: ${eventName}-complete\ndata: finished\n\n`);
         clearInterval(interval);
       }
 
-    } catch (err) {
-      res.write(`event: error\ndata: Jenkins error: ${err.message}\n\n`);
+    } catch (e) {
+      res.write(`event: error\ndata: Jenkins error ${e.message}\n\n`);
     }
-
   }, 3000);
 
   return () => {
@@ -106,38 +94,50 @@ async function streamJenkinsLogs({ res, jobName, jobType }) {
   };
 }
 
-async function streamAppLogs({ res, deployment }) {
-  let stopped = false;
+/* ================= CLOUDWATCH HELPERS ================= */
 
-  const logs = await assumeAccountCLogs();
+async function getLatestStream(logs, logGroupName) {
+  const data = await logs.describeLogStreams({
+    logGroupName,
+    orderBy: "LastEventTime",
+    descending: true,
+    limit: 1
+  }).promise();
+
+  if (!data.logStreams.length) return null;
+  return data.logStreams[0].logStreamName;
+}
+
+/* ================= EC2 STREAM ================= */
+
+async function streamEc2Logs({ res, logs, accessGroup, errorGroup }) {
+  let stopped = false;
   let startTime = Date.now() - 5 * 60 * 1000;
 
   const interval = setInterval(async () => {
     if (stopped) return;
 
     try {
-      for (const [type, logGroupName] of [
-        ["access", deployment.accessLogGroup],
-        ["error", deployment.errorLogGroup]
+      for (const [eventName, group] of [
+        ["access", accessGroup],
+        ["error", errorGroup]
       ]) {
-        if (!logGroupName) continue;
+        if (!group || group === "NA") continue;
 
-        const result = await logs.filterLogEvents({
-          logGroupName,
+        const r = await logs.filterLogEvents({
+          logGroupName: group,
           startTime,
           limit: 50
         }).promise();
 
-        for (const e of result.events || []) {
-          res.write(`event: ${type}\ndata: ${e.message.replace(/\n/g, " ")}\n\n`);
+        for (const e of r.events || []) {
+          res.write(`event: ${eventName}\ndata: ${e.message}\n\n`);
           startTime = Math.max(startTime, e.timestamp + 1);
         }
       }
-
-    } catch (err) {
-      res.write(`event: error\ndata: App logs error: ${err.message}\n\n`);
+    } catch (e) {
+      res.write(`event: error\ndata: EC2 logs error ${e.message}\n\n`);
     }
-
   }, 4000);
 
   return () => {
@@ -146,51 +146,139 @@ async function streamAppLogs({ res, deployment }) {
   };
 }
 
-/* ================= ROUTE ================= */
+/* ================= EKS STREAM ================= */
+/* FINAL WORKING FIX */
+
+async function streamEksLogs({ res, logs, logGroup }) {
+  let stopped = false;
+
+  const streamName = await getLatestStream(logs, logGroup);
+  if (!streamName) return () => {};
+
+  let nextToken = null;
+
+  const interval = setInterval(async () => {
+    if (stopped) return;
+
+    try {
+      const params = {
+        logGroupName: logGroup,
+        logStreamName: streamName,
+        startFromHead: false
+      };
+
+      if (nextToken) params.nextToken = nextToken;
+
+      const data = await logs.getLogEvents(params).promise();
+      nextToken = data.nextForwardToken;
+
+      for (const e of data.events) {
+        let message = e.message;
+
+        // Extract nginx log from EKS JSON
+        try {
+          const parsed = JSON.parse(e.message);
+          if (parsed.log) {
+            message = parsed.log;
+          }
+        } catch {}
+
+        message = message
+          .replace(/\r/g, "")
+          .replace(/\n/g, "")
+          .trim();
+
+        // IMPORTANT: embed prefix so frontend coloring works
+        res.write(`event: access\ndata: event: access ${message}\n\n`);
+      }
+
+    } catch (e) {
+      res.write(`event: error\ndata: EKS logs error ${e.message}\n\n`);
+    }
+  }, 4000);
+
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
+}
+
+/* ================= MAIN ROUTE ================= */
 
 router.get("/logs/stream", async (req, res) => {
   const { deploymentId } = req.query;
 
   if (!deploymentId) {
-    return res.status(400).json({ error: "deploymentId is required" });
+    return res.status(400).json({ error: "deploymentId required" });
   }
 
   setSseHeaders(res);
 
   let stopCurrent = null;
   let currentMode = null;
+  const logsClient = await assumeLogs();
 
   const loop = setInterval(async () => {
     try {
-      const deployment = await getDeployment(deploymentId);
-
-      if (!deployment) {
-        res.write(`event: error\ndata: Deployment not found\n\n`);
-        return;
-      }
+      const dep = await getDeployment(deploymentId);
+      if (!dep) return;
 
       let nextMode = null;
       let starter = null;
 
-      if (deployment.status === "RUNNING") {
+      if (dep.status === "DEPLOYING" && dep.deployBuildNumber !== "NA") {
         nextMode = "deploy";
-        starter = () => streamJenkinsLogs({ res, jobName: deployment.deployJob, jobType: "deploy" });
-      } else if (deployment.status === "DESTROYING") {
+        starter = () =>
+          streamJenkins({
+            res,
+            jobName: dep.deployJobName,
+            buildNumber: dep.deployBuildNumber,
+            eventName: "deploy"
+          });
+      }
+
+      else if (dep.status === "DESTROYING" && dep.destroyBuildNumber !== "NA") {
         nextMode = "destroy";
-        starter = () => streamJenkinsLogs({ res, jobName: deployment.destroyJob, jobType: "destroy" });
-      } else if (deployment.status === "SUCCESS") {
-        nextMode = "runtime";
-        starter = () => streamAppLogs({ res, deployment });
+        starter = () =>
+          streamJenkins({
+            res,
+            jobName: dep.destroyJobName,
+            buildNumber: dep.destroyBuildNumber,
+            eventName: "destroy"
+          });
+      }
+
+      else if (dep.status === "RUNNING") {
+        if (dep.runtime === "ec2") {
+          nextMode = "ec2";
+          starter = () =>
+            streamEc2Logs({
+              res,
+              logs: logsClient,
+              accessGroup: dep.logGroupAccess,
+              errorGroup: dep.logGroupError
+            });
+        }
+
+        else if (dep.runtime === "eks-fargate" || dep.runtime === "eks-ec2") {
+          nextMode = "eks";
+          starter = () =>
+            streamEksLogs({
+              res,
+              logs: logsClient,
+              logGroup: dep.logGroup
+            });
+        }
       }
 
       if (nextMode !== currentMode) {
         if (stopCurrent) stopCurrent();
         currentMode = nextMode;
-        stopCurrent = starter ? await starter() : null;
+        if (starter) stopCurrent = await starter();
       }
 
-    } catch (err) {
-      res.write(`event: error\ndata: ${err.message}\n\n`);
+    } catch (e) {
+      res.write(`event: error\ndata: ${e.message}\n\n`);
     }
   }, 3000);
 
