@@ -76,6 +76,12 @@ async function extractDeploymentInfo(jobName, buildNumber, runtime) {
       info.metricsType = "eks";
     }
 
+    // ===== NEW: Generic runtime safety =====
+    if (runtime === "generic") {
+      info.metricsEnabled = false;
+      info.metricsType = "NA";
+    }
+
     return info;
 
   } catch (err) {

@@ -135,7 +135,7 @@ router.post("/deploy", async (req, res) => {
       });
     }
 
-    const allowedRuntimes = ["ec2", "eks-fargate", "eks-ec2"];
+    const allowedRuntimes = ["ec2", "eks-fargate", "eks-ec2", "generic"];
 
     if (!allowedRuntimes.includes(runtime)) {
       return res.status(400).json({
@@ -159,7 +159,8 @@ router.post("/deploy", async (req, res) => {
       destroyJobName,
       ec2Support,
       eksFargateSupport,
-      eksEc2Support
+      eksEc2Support,
+      genericSupport // <-- NEW
     } = app;
 
     /* ===== 3. Validate Runtime Support ===== */
@@ -179,6 +180,13 @@ router.post("/deploy", async (req, res) => {
     if (runtime === "eks-ec2" && !eksEc2Support) {
       return res.status(400).json({
         error: "EKS EC2 not supported for this application"
+      });
+    }
+
+    // ===== NEW: Generic validation =====
+    if (runtime === "generic" && !genericSupport) {
+      return res.status(400).json({
+        error: "Generic deployment not supported for this application"
       });
     }
 
@@ -293,8 +301,7 @@ router.post("/deploy", async (req, res) => {
   }
 });
 
-module.exports = router;
-const router = require("express").Router();
+module.exports = router;const router = require("express").Router();
 const axios = require("axios");
 const AWS = require("aws-sdk");
 
@@ -1924,6 +1931,12 @@ async function extractDeploymentInfo(jobName, buildNumber, runtime) {
       info.metricsType = "eks";
     }
 
+    // ===== NEW: Generic runtime safety =====
+    if (runtime === "generic") {
+      info.metricsEnabled = false;
+      info.metricsType = "NA";
+    }
+
     return info;
 
   } catch (err) {
@@ -2015,8 +2028,7 @@ async function watchDeployment({
   }
 }
 
-module.exports = { watchDeployment };
-const AWS = require("aws-sdk");
+module.exports = { watchDeployment };const AWS = require("aws-sdk");
 const axios = require("axios");
 
 const {

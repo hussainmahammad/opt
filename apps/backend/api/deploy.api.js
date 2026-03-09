@@ -83,7 +83,7 @@ router.post("/deploy", async (req, res) => {
       });
     }
 
-    const allowedRuntimes = ["ec2", "eks-fargate", "eks-ec2"];
+    const allowedRuntimes = ["ec2", "eks-fargate", "eks-ec2", "generic"];
 
     if (!allowedRuntimes.includes(runtime)) {
       return res.status(400).json({
@@ -107,7 +107,8 @@ router.post("/deploy", async (req, res) => {
       destroyJobName,
       ec2Support,
       eksFargateSupport,
-      eksEc2Support
+      eksEc2Support,
+      genericSupport // <-- NEW
     } = app;
 
     /* ===== 3. Validate Runtime Support ===== */
@@ -127,6 +128,13 @@ router.post("/deploy", async (req, res) => {
     if (runtime === "eks-ec2" && !eksEc2Support) {
       return res.status(400).json({
         error: "EKS EC2 not supported for this application"
+      });
+    }
+
+    // ===== NEW: Generic validation =====
+    if (runtime === "generic" && !genericSupport) {
+      return res.status(400).json({
+        error: "Generic deployment not supported for this application"
       });
     }
 
