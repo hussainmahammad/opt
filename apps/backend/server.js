@@ -23,6 +23,7 @@ app.use("/api", require("./api/appLogs.api"));
 app.use("/api", require("./api/metrics.api"));
 app.use("/api", require("./api/logsSse")); 
 app.use("/api", require("./api/applicationUrl")); 
+app.use("/api", require("./api/deploymentStatus.api"));
 
 const PORT = process.env.PORT || 3000;
 
